@@ -476,3 +476,123 @@ describe("FINDING 17: a FALSY value on an aliased attribute is lost entirely", (
 		expect(Object.prototype.hasOwnProperty.call(returnObject, "n")).toBe(true);
 	});
 });
+
+describe("FINDING 18: a schema-level `set` modifier makes dynamoPropertyForAttribute return the WRONG attribute", () => {
+	it("returns the modifier's key instead of the requested attribute", async () => {
+		const M = dynamoose.model("SetModifierCat", new dynamoose.Schema(
+			{"id": Number, "name": String},
+			{"set": (item) => ({type: "user", ...item})}
+		));
+		new dynamoose.Table("SetModifierCat", [M], {"initialize": false});
+
+		const resolved = await M.Model.getInternalProperties(internalProperties).dynamoPropertyForAttribute("name");
+		expect(resolved).toBe("name");
+	});
+});
+
+describe("FINDING 19: dynamoPropertyForAttribute crashes on a type-specific `set` modifier", () => {
+	it("the modifier receives `true` instead of the attribute value", async () => {
+		const M = dynamoose.model("TypeSetModifierCat", {
+			"id": Number,
+			"name": {"type": String, "set": (value) => value.trim()}
+		});
+		new dynamoose.Table("TypeSetModifierCat", [M], {"initialize": false});
+
+		await expect(M.Model.getInternalProperties(internalProperties).dynamoPropertyForAttribute("name")).resolves.toBe("name");
+	});
+});
+
+describe("FINDING 20: Model.update silently drops an aliased attribute", () => {
+	it("the update expression is empty when the attribute is named by its alias", async () => {
+		const M = dynamoose.model("UpdateAliasCat", {"id": Number, "name": {"type": String, "alias": "userName"}});
+		new dynamoose.Table("UpdateAliasCat", [M], {"initialize": false});
+
+		const viaAlias = await M.update({"id": 1}, {"userName": "bob"}, {"return": "request"});
+		expect(viaAlias.UpdateExpression).toBe("SET #a0 = :v0");
+
+		const viaSchemaName = await M.update({"id": 1}, {"name": "bob"}, {"return": "request"});
+		expect(viaSchemaName.UpdateExpression).toBe("SET #a0 = :v0");
+	});
+});
+
+describe("FINDING 21: an attribute literally named \"0\" crashes the schema-aware paths", () => {
+	it("saving an item with a \"0\" attribute throws", async () => {
+		const M = dynamoose.model("ZeroAttrCat", {"id": Number, "0": String});
+		new dynamoose.Table("ZeroAttrCat", [M], {"initialize": false});
+
+		await expect(new M({"id": 1, "0": "x"}).toDynamo({"modifiers": ["set"]})).resolves.toBeDefined();
+	});
+
+	it("control: an attribute named \"1\" works fine", async () => {
+		const M = dynamoose.model("OneAttrCat", {"id": Number, "1": String});
+		new dynamoose.Table("OneAttrCat", [M], {"initialize": false});
+
+		const result = await new M({"id": 1, "1": "x"}).toDynamo({"modifiers": ["set"]});
+		expect(result).toEqual({"id": {"N": "1"}, "1": {"S": "x"}});
+	});
+});
+
+describe("FINDING 22: the key condition can use a non-equality operator on the partition key", () => {
+	const Model = dynamoose.model("PartitionOpCat", {"id": Number, "age": Number});
+	new dynamoose.Table("PartitionOpCat", [Model], {"initialize": false});
+
+	it("emits `>` for the partition key, which DynamoDB forbids", async () => {
+		const request = await Model.query("age").eq(1).where("id").gt(2).where("id").eq(3).getRequest();
+		// AWS: "You must specify the partition key name and value as an equality condition."
+		expect(request.KeyConditionExpression).toBe("#qha = :qhv");
+	});
+
+	it("an equality plus a later comparison on the same attribute is not found at all", async () => {
+		// The comparison chart keeps only the LAST comparison per attribute, so the
+		// hash key equality is invisible to find_best_index.
+		await expect(Model.query("id").eq(1).where("id").gt(2).getRequest()).resolves.toBeDefined();
+	});
+});
+
+describe("FINDING 23: an empty parenthesised group produces an invalid expression", () => {
+	it("emits `AND ()`", async () => {
+		const Model = dynamoose.model("EmptyGroupCat", {"id": Number, "name": String});
+		new dynamoose.Table("EmptyGroupCat", [Model], {"initialize": false});
+
+		const condition = new dynamoose.Condition().where("name").eq(1).parenthesis((c) => c).where("id").eq(2);
+		const request = await condition.getInternalProperties(internalProperties).requestObject(
+			Model.Model,
+			{"conditionString": "ConditionExpression", "conditionStringType": "string"}
+		);
+		expect(request.ConditionExpression).not.toMatch(/\(\s*\)/);
+	});
+});
+
+describe("FINDING 24: type settings leak across entries of a multi-type array", () => {
+	it("the second entry inherits the first entry's settings", () => {
+		const schema = new dynamoose.Schema({"id": {"type": [{"value": Date, "settings": {"storage": "iso"}}, Date]}});
+		// The plain `Date` has no settings, so it should default to milliseconds ("N").
+		expect(schema.getAttributeTypeDetails("id").map((details) => details.dynamodbType)).toEqual(["S", "N"]);
+	});
+
+	it("control: the reverse order is correct", () => {
+		const schema = new dynamoose.Schema({"id": {"type": [Date, {"value": Date, "settings": {"storage": "iso"}}]}});
+		expect(schema.getAttributeTypeDetails("id").map((details) => details.dynamodbType)).toEqual(["N", "S"]);
+	});
+});
+
+describe("FINDING 25: keyBy drops the entry whose key is \"__proto__\"", () => {
+	it("the item disappears from the result", () => {
+		const result = utils.keyBy([{"id": "__proto__"}], "id");
+		expect(Object.keys(result)).toEqual(["__proto__"]);
+	});
+
+	it("control: a normal key is mapped", () => {
+		expect(Object.keys(utils.keyBy([{"id": "a"}], "id"))).toEqual(["a"]);
+	});
+});
+
+describe("FINDING 26: unique_array_elements drops a NaN element", () => {
+	it("a lone NaN is filtered out entirely", () => {
+		expect(utils.unique_array_elements([NaN])).toEqual([NaN]);
+	});
+
+	it("control: a normal value survives", () => {
+		expect(utils.unique_array_elements([1, 1, 2])).toEqual([1, 2]);
+	});
+});
