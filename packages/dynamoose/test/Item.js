@@ -3592,3 +3592,51 @@ describe("Item", () => {
 		});
 	});
 });
+
+describe("Item - aliased attribute holding a falsy value (regression)", () => {
+	beforeEach(() => {
+		dynamoose.Table.defaults.set({
+			"create": false,
+			"waitForActive": false
+		});
+	});
+	afterEach(() => {
+		dynamoose.Table.defaults.set({});
+	});
+
+	const readBack = async (name, schema, input) => {
+		const Model = dynamoose.model(name, new dynamoose.Schema(schema));
+		new dynamoose.Table(`${name}Table`, [Model]);
+		const item = new Model(input);
+		await item.conformToSchema({"type": "fromDynamo", "customTypesDynamo": true, "saveUnknown": true, "modifiers": ["get"], "mapAttributes": true});
+		return item;
+	};
+
+	it("Should preserve a stored 0 on an aliased attribute", async () => {
+		// conformToSchema used to test the renamed value for truthiness, so 0 was never
+		// written back and the schema-named key was then deleted.
+		const item = await readBack("AliasFalsyZero", {"id": Number, "n": {"type": Number, "alias": "nn"}}, {"id": 1, "n": 0});
+		expect(item.nn).toBe(0);
+		expect(item.n).toBe(undefined);
+	});
+
+	it("Should preserve a stored empty string on an aliased attribute", async () => {
+		const item = await readBack("AliasFalsyEmpty", {"id": Number, "s": {"type": String, "alias": "ss"}}, {"id": 1, "s": ""});
+		expect(item.ss).toBe("");
+	});
+
+	it("Should preserve a stored false on an aliased attribute", async () => {
+		const item = await readBack("AliasFalsyFalse", {"id": Number, "b": {"type": Boolean, "alias": "bb"}}, {"id": 1, "b": false});
+		expect(item.bb).toBe(false);
+	});
+
+	it("Should still map a truthy value (control)", async () => {
+		const item = await readBack("AliasTruthyFive", {"id": Number, "n": {"type": Number, "alias": "nn"}}, {"id": 1, "n": 5});
+		expect(item.nn).toBe(5);
+	});
+
+	it("Should still keep a falsy value on a NON-aliased attribute (control)", async () => {
+		const item = await readBack("AliasFalsyPlain", {"id": Number, "n": Number}, {"id": 1, "n": 0});
+		expect(item.n).toBe(0);
+	});
+});

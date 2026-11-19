@@ -901,7 +901,11 @@ Item.prototype.conformToSchema = async function (this: Item, settings: ItemObjec
 
 		for (const key in mapSettingObject) {
 			const expectedObjectValue = utils.object.get(expectedObject, key);
-			if (expectedObjectValue) {
+			// Check for presence, not truthiness. A stored `0`, `""` or `false` is a real
+			// value. Testing truthiness skipped the write, and the loop below then deleted
+			// the schema-named key because it is not in expectedKeys -- losing the
+			// attribute entirely.
+			if (expectedObjectValue !== undefined) {
 				utils.object.set(this as any, key, expectedObjectValue);
 			}
 		}
