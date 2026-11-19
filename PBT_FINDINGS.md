@@ -93,6 +93,17 @@ throws for `undefined`/`null`, so the check passes.
 A control attribute named `normal` correctly throws. `valueOf`, `hasOwnProperty`
 and `toLocaleString` behave the same way.
 
+**Impact correction (second pass).** The failure mode is *not* "silently saved
+without the value". It depends on the entry point, and I verified both:
+
+| entry point | actual behaviour |
+|---|---|
+| `item.save()` (the real path) | **throws** `TypeError: Cannot destructure property 'customType' of 'typeDetails' as it is undefined` — a confused crash, not a clean `ValidationError`, and nothing is written |
+| `toDynamo({required: true})` | **no throw** — the required check silently passes |
+
+So the defect is a *misleading crash on save* plus a *silently bypassed check* on
+the lower-level call — not silent data loss. Severity is correspondingly lower.
+
 ### 5. An array default containing a null element is silently dropped — **MEDIUM**
 The whole attribute disappears — no error, no warning.
 
@@ -326,6 +337,14 @@ await new M({"id": 1, "0": "x"}).save();
 Root cause: `Item.ts:577-586` assumes any node named `"0"` is an array index.
 `"1"`, `"00"`, `"a0"` all work — only the exact `"0"` is broken. The Schema
 constructor accepts the name (only dots are forbidden).
+
+**Severity correction (second pass).** `packages/dynamoose/test/Schema.js:110`
+contains a **skipped** test — `it.skip("Should throw error if attribute names only
+contains number", …)` — which shows the maintainers intend purely numeric attribute
+names to be *rejected*, not supported. So `"0"` is arguably out of contract. The
+remaining defect is that the rejection is a raw `TypeError` deep inside
+`objectFromSchema` rather than a clear validation error at Schema construction.
+Low severity.
 
 ### 22. The key condition can use a non-equality operator on the partition key — **MEDIUM-HIGH**
 ```js
