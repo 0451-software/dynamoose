@@ -13,8 +13,27 @@ agent whose only job was to **refute** it.
 
 That last step mattered. Three candidates were refuted and dropped, one was
 reclassified as a documentation inaccuracy, and the severity of five more was
-corrected downward. The final count is **25 confirmed bugs**, not the 41
-candidates that were initially reported.
+corrected downward. The final count is **24 confirmed bugs** (25 findings, two of
+which turned out to be one defect), not the 41 candidates first reported.
+
+## Second pass: independent re-validation
+
+The whole set was then re-reviewed by a **different model** (deepseek-v4.1-flash)
+with two fresh refuters working disjoint halves, told to *refute*. **No finding
+was refuted outright**, but six were materially corrected — two of them in ways
+that change what the bug actually is:
+
+| Finding | Correction |
+|---|---|
+| **17** — falsy aliased value | **Root cause was miscited.** Not `Item.ts:653`; it is the truthiness test at `Item.ts:902-907` plus the delete at `910-916`. **Escalated to the top silent-data-loss finding**, because a plain `Model.get` loses a stored `0`/`""`/`false`. |
+| **1** — `or()` | "Any `or()`" was too broad. Only a **top-level** `or()` in a Query chain crashes; `or()` inside `parenthesis()` works and passes upstream tests. |
+| **2** — key inside `parenthesis()` | Throw is at `ItemRetriever.ts:199`, not `:197`. Variant B needs exactly 11 conditions; corruption generalises past `#a1`/`#a10`. |
+| **4 + 11** — `Object.prototype` names | **Same defect, merged.** Also broader than stated — `.save()` throws for any such name, with or without a default. |
+| **18** — schema-level `set` | Only a **prepending** `set` reorders; it also clobbers the **key** attribute. |
+| **20** — `Model.update` alias | Contract settled from the docs: the alias is the app-facing name for **both** read and write, so this is a genuine round-trip data-loss bug, not user error. |
+| **5, 13, 14, 21, 23** | Severity/scope tightened; see inline notes. |
+
+Each correction above was re-verified by the parent agent, not accepted on trust.
 
 Every finding below was reproduced by running the code against the real
 `dynamoose` public API, not by reading it — and each was then re-verified
@@ -24,14 +43,20 @@ each confirmed bug has a named, self-contained failing test.
 
 ## The confirmed bugs
 
-### 1. Any `or()` in a query crashes request construction — **HIGH**
+### 1. A top-level `or()` in a query crashes request construction — **HIGH**
 `Model.query(...).or()...` throws `TypeError: Cannot read properties of undefined (reading '0')`.
-Leading, middle and trailing `or()` all fail; scans are unaffected because
-`comparisonChart` is only called for queries.
+Leading, middle and trailing **top-level** `or()` all fail.
 
-Root cause: `Condition.ts:264-266` reduces over `settings.conditions` and calls
+**Scope correction (second pass):** "any `or()`" was too broad. `or()` nested
+inside `parenthesis()` or `group()` works correctly, and `test/Query.js:699-729`
+("nested groups with OR/AND") exercises exactly that and **passes** (verified
+4/4). Scans are unaffected because `comparisonChart` is only reached for
+`type === "query"` (`ItemRetriever.ts:179-190`). The crash is exclusively in
+`comparisonChart`, which only a top-level `or()` reaches.
+
+Root cause: `Condition.ts:264-269` reduces over `settings.conditions` and calls
 `Object.entries(item)[0]`. The `OR` entry is a `Symbol`, so `Object.entries(OR)` is
-`[]` and the destructure throws.
+`[]`, `myItem` is `undefined`, and `myItem[0]` throws.
 
 ```js
 Model.query("id").eq(1).or().where("age").eq(2).getRequest()
@@ -44,20 +69,26 @@ it — but those tests exercise `requestObject`, not `comparisonChart`.
 ### 2. A key condition inside `parenthesis()` breaks the query — **HIGH**
 Two distinct failures, both reachable from the public `Query` API.
 
-*Crash* — `moveParameterNames` (`ItemRetriever.ts:197`) searches the
-`FilterExpression` array with `item.includes(key)`. For a grouped condition the
-entry is a nested array, and `Array.includes` is an exact match, so `findIndex`
-returns `-1` and the code dereferences `undefined`.
+*Crash* — `moveParameterNames` searches the `FilterExpression` array with
+`item.includes(key)` (`ItemRetriever.ts:197`). For a grouped condition the entry
+is a nested array, and `Array.prototype.includes` is an exact match, so
+`findIndex` returns `-1`; the actual throw is at `:199`, which dereferences the
+resulting `undefined`.
 
-**Scope caveat (corrected in the second pass):** this crash does *not* fire for
-every grouped key condition. It did not reproduce when `.using()` named a real
-index whose key schema matched the model. It needs a narrower shape — a grouped
-key condition plus an index whose key cannot be resolved that way. The
-corruption variant below is the reliable one, and it is what the finding rests on.
+**Scope (second pass, precise):** variant A fires when the resolved index's
+key attribute is conditioned *inside* `parenthesis()` — e.g. a grouped hash key
+with `.using()` on an index whose hash is that attribute reproduces
+`reading 'includes'`. A plain grouped query, or a group over non-key attributes,
+does not. Variant B needs a specific shape: exactly one condition *before* the
+group (so the grouped hash becomes `#a1`), 9 conditions *inside* it, and 1 after
+— **11 conditions total**. At 10 total there is no `#a1x` sibling to
+prefix-match, so it falls back to the variant-A crash.
 
 *Corruption* — `#a1` is a prefix of `#a10`, so `findIndex` matches the wrong
 entry and the subsequent `replace` turns `#a10` into `#qha0`, emitting a
-`KeyConditionExpression` that references placeholders which do not exist:
+`KeyConditionExpression` that references placeholders which do not exist. This
+generalizes past the `#a1`/`#a10` pair — a 12th condition yields
+`#qha1 = :qhv1` from `#a11`:
 
 ```
 KeyConditionExpression: "#qha0 = :qhv0"
@@ -76,8 +107,12 @@ The "already assigned" guard itself is intentional (`test/Table.js:50-54` assert
 it). The defect is the ordering. A user who fixes their schema and retries with
 the same model objects cannot recover without a process restart.
 
-### 4. A `required` attribute named after an `Object.prototype` member is not enforced — **MEDIUM**
-Silent data loss: a required field is saved **without** a value.
+### 4. Attributes named after an `Object.prototype` member break defaults, `required`, and `save()` — **LOW-MEDIUM**
+*(Findings 4 and 11 are **one defect** with two symptoms — a prototype-chain
+lookup — and were merged in the second pass.)*
+
+Not silent data loss. The attribute is absent from a directly-built item, but the
+real `.save()` path throws before writing anything — see the impact table below.
 
 ```js
 const M = dynamoose.model("M", {"id": Number, "toString": {"type": String, "required": true}});
@@ -112,6 +147,12 @@ The whole attribute disappears — no error, no warning.
 // => {"id": 1}          <-- "arr" is GONE
 // control: default () => ["a", "b"]  =>  {"id": 1, "arr": ["a", "b"]}
 ```
+
+**Precision (second pass).** "Expected `{arr: ["a", null]}`" only holds with
+`typeCheck: false`. With `typeCheck: true` an *explicit* `["a", null]` is a
+`TypeMismatch`, so the correct behaviour there is a clear error, not a silent
+drop. The decisive evidence is the asymmetry: an **object** default `{a: null}`
+is preserved intact. Severity is LOW-MEDIUM, not MEDIUM.
 
 Root cause: `Item.ts:711` computes
 `isDefaultValueUndefined = Array.isArray(defaultValue) ? defaultValue.some((v) => v == null) : ...`.
@@ -198,10 +239,15 @@ the `__proto__` setter.
 a remotely exploitable vulnerability in a normal Dynamoose app — it requires the
 application to route untrusted JSON into a configuration setter.
 
-### 11. An attribute named after an `Object.prototype` member never gets its default — **LOW-MEDIUM**
-Same root cause as finding 4, in the defaults loop (`Item.ts:707`). The attribute
+### 11. (merged into 4) An `Object.prototype` attribute name never gets its default — **LOW-MEDIUM**
+Same root cause as finding 4, in the defaults loop (`Item.ts:709`). The attribute
 is omitted entirely from the saved item. It works correctly when a value is
 supplied explicitly.
+
+**Merged with finding 4 in the second pass** — one defect, two symptoms. It is
+also broader than stated: `.save()` throws a `TypeError` for *any* attribute named
+`toString`/`constructor`/`hasOwnProperty`/`valueOf`, with or without a default, so
+no silent write occurs on the real path.
 
 ### 12. `merge_objects` output shape depends on the truthiness of the accumulated value — **LOW**
 Under `array_merge_new_array`, a truthy first value yields `[value, newValue]`
@@ -222,16 +268,30 @@ overwrite-with-`3` are numerically identical, so it is unobservable there.
 `IN ()` is a DynamoDB syntax error. Dynamoose performs no length validation on
 the `in` array.
 
+**Classified in the second pass as missing validation, not wrong results.** The
+grammar requires at least one operand — `condition ::= … | {operand} IN
+( {operand} (',' {operand} … ) )` — so `IN ()` is not derivable. The docs say
+`in(values)` "must be an array" and never forbid an empty one, so `[]` is legal
+*input*; the library should reject it or short-circuit to no results instead of
+emitting an unparseable expression with no values bucket. Verified end-to-end:
+a DynamoDB server rejects it.
+
 ### 14. `between()` with fewer than two arguments emits undefined placeholders — **LOW**
 ```js
 new dynamoose.Condition("name").between(1)
 // ConditionExpression: "#a0 BETWEEN :v0_1 AND :v0_2"
 // ExpressionAttributeValues: {":v0_1": {...}}   <-- :v0_2 is undefined and dropped
 ```
-`between` is variadic (`multipleArguments: true`) with no arity validation. The
-AWS SDK's low-level serializer silently drops the undefined value, so DynamoDB
-receives a `BETWEEN` with a missing bound and rejects it with a service-side
-validation error. Dynamoose itself does not crash.
+`between` is variadic (`multipleArguments: true`, `Condition.ts:68`) with no arity
+validation — `Condition.ts:448-458` warns only for an explicit `undefined`
+argument, never for a short argument list, and the type is `(...values: any[])` so
+TypeScript cannot catch it either.
+
+**Precision (second pass):** `:v0_2` is not absent — it **exists with the value
+`undefined`** (`JSON.stringify` hides it; `hasOwnProperty(':v0_2') === true`).
+The AWS SDK serializer then drops the key, so the wire request references a
+placeholder that the SDK never sent. `between()` with **zero** arguments is worse:
+both placeholders are undefined and the values bucket is empty.
 
 ### 16. A nested `Schema` plus a parent `saveUnknown: true` crashes on save — **MEDIUM**
 ```js
@@ -265,7 +325,7 @@ Note the model must be built from the `Schema` **instance**. Building the same
 shape from a plain object schema produces a different internal layout and does
 not crash.
 
-### 17. A falsy value on an aliased attribute is lost entirely — **MEDIUM**
+### 17. A falsy value on an aliased attribute is lost entirely — **HIGH**
 ```js
 const M = dynamoose.model("M", {"id": Number, "n": {"type": Number, "alias": "nn"}});
 const item = new M({"id": 1, "n": 0});
@@ -281,13 +341,24 @@ A truthy value on the same attribute is correctly renamed to the alias
 survives untouched (`item.n === 0`). Only the combination of *alias* + *falsy
 value* loses data.
 
-Root cause: `Item.ts:653` guards the rename with
-`if (returnObject[oldKey] !== undefined)`. For `0`, `""` and `false` the value
-**is present** but the guard is about `undefined`, so — depending on direction —
-the rename is skipped and the schema-named key is then removed by the
-"not in the schema" check, taking the value with it.
+**Root cause (corrected in the second pass — the earlier citation was wrong).**
+Not `Item.ts:653`: that guard is `!== undefined` and it passes. Proof —
+`objectFromSchema` alone correctly yields `{id: 1, nn: 0}`, so the mapping itself
+works. The loss happens in `conformToSchema`:
 
-No existing test covers an alias with a falsy value.
+- `Item.ts:902-907` — `if (expectedObjectValue)` is a **truthiness** test, so a
+  renamed value of `0`, `""` or `false` is never written back onto the item;
+- `Item.ts:910-916` — the schema-named key (`n`) is then deleted because it is not
+  in `expectedKeys`, taking the only remaining copy with it.
+
+**Severity re-stated: this is the most serious silent-data-loss finding.** It
+needs no pathological name, no unusual default, no exotic modifier. A plain
+`Model.get` on a stored `0`, `""` or `false` for an aliased attribute returns the
+item with that attribute gone. Verified: `Model.get(1)` against a raw item
+`{id: 1, n: {N: "0"}}` returns `{id: 1}` with `nn === undefined`.
+
+No existing test covers an alias with a falsy value — `Item.js` contains no
+`alias` tests at all.
 
 ### 18. A schema-level `set` modifier makes `dynamoPropertyForAttribute` return the WRONG attribute — **HIGH**
 ```js
@@ -301,9 +372,16 @@ await M.Model.getInternalProperties(ip).dynamoPropertyForAttribute("name");
 Root cause: `Model/index.ts:278-279` builds a probe object `{[attribute]: true}` and
 returns `Object.keys(obj)[0]` — the **first** key — which a `set` modifier can reorder.
 
-Every `Condition` on such a model silently filters on the **wrong attribute**
-(`ExpressionAttributeNames: {"#a0": "type"}`). Reachable from `Model.scan`,
-`Model.query`, `Model.update`, `Model.delete` with a condition.
+Every `Condition` on such a model silently filters on the **wrong attribute** — a
+real `scan` emits `ExpressionAttributeNames: {"#a0": "type"}`. Reachable from
+`Model.scan`, `Model.query`, `Model.update`, `Model.delete` with a condition.
+
+**Precision (second pass).** The trigger is narrower than "a `set` modifier":
+only a `set` that **prepends** a key — `(item) => ({type: "user", ...item})` —
+changes the order. Appending is harmless. It also clobbers the **key**
+attribute: `dynamoPropertyForAttribute("id")` returns `"type"` too, so key
+conditions break as well. The feature works end-to-end for writes (the added key
+is persisted), which makes this a resolution bug rather than unsupported input.
 
 ### 19. `dynamoPropertyForAttribute` crashes on a type-specific `set` modifier — **HIGH**
 ```js
@@ -323,6 +401,15 @@ await M.update({"id": 1}, {"userName": "bob"}, {"return": "request"});
 // actual:   {"UpdateExpression": "", "ExpressionAttributeNames": {}}
 // expected: {"UpdateExpression": "SET #a0 = :v0", "ExpressionAttributeNames": {"#a0": "name"}}
 ```
+**Contract settled (second pass) — this is not user error.** `Schema.ts:740-742`
+states the alias is the app-facing name: *"When retrieving data from DynamoDB, the
+attribute will be renamed to this property name… When saving to DynamoDB, the
+attribute name will always be used."* Verified: `Model.get` returns `userName`,
+and `new M({userName}).save()` correctly writes `name`. Reads return the alias and
+writes accept it, so `Model.update` is the only path that disagrees. A
+read-then-update round trip therefore loses data — the field vanishes entirely
+when it is the only one, and is silently dropped from a mixed `SET` otherwise.
+
 Root cause: `Model/index.ts:757` reads back `[subKey]` (the alias) from a result
 that `objectFromSchema` already renamed to the schema attribute name, so the
 value is `undefined` and the branch at `:760-765` drops the update. A silent
@@ -358,6 +445,13 @@ Related: the comparison chart keeps only the **last** comparison per attribute
 (`Condition.ts:264-269` overwrites `res[key]`), so `query("id").eq(1).where("id").gt(2)`
 throws `Index can't be found for query.` — the hash-key equality is invisible to
 `find_best_index`.
+
+**Nature (second pass).** The first half is a real defect: it silently emits a
+`KeyConditionExpression` DynamoDB must reject, and `moveParameterNames` already
+declines to move `contains`/`attribute_not_exists`, so operator legality is
+intended behaviour — just incompletely implemented. The
+`"Index can't be found for query."` half is *not* an invalid request, only a
+misleading diagnosis: the user did name the table's hash key, just with `gt`.
 
 ### 23. An empty parenthesised group produces an invalid expression — **MEDIUM**
 ```js
@@ -516,9 +610,20 @@ These are as valuable as the bugs — they pin down intended behaviour:
 
 ## Suggested order of work
 
-Findings 1–3, 18–20 and 22 are user-visible failures on ordinary, documented
-API usage — they should come first. Findings 4–5, 17 and 26 are silent data
-loss and should come next. Findings 7, 10 and 14 are hardening items.
+**Start with finding 17.** After the second pass it is the clearest harm: a
+plain `Model.get` silently loses a stored `0`, `""` or `false` on any aliased
+attribute. No pathological input required. It outranks everything else.
+
+Then findings 1–3 and 18–20 — user-visible failures on ordinary, documented API
+usage. Finding 2's corruption variant needs 11 conditions, so its real-world odds
+are lower than 1's, but both are on everyday query patterns.
+
+Then 22 (silently emits an invalid key condition) and 5 (silent loss under
+`typeCheck: false`).
+
+Findings 13, 14, 21 and 23 are missing-validation hardening items — the server
+rejects them loudly, so they cost a confusing error, not corrupted data.
+Findings 7, 10 and 12 are utility-level hardening.
 
 Findings 18–20 share a theme worth calling out: **a modifier or alias silently
 changes which attribute is targeted**. In each case the request is still
@@ -526,10 +631,11 @@ well-formed, so nothing errors — it just operates on the wrong data. These are
 the ones most likely to cause real harm in production, because nothing in the
 logs looks wrong.
 
-Findings 1, 2, 9, 10, 15, 21–23 all produce requests that DynamoDB will
-reject. They are loud failures rather than silent ones, which makes them easier
-to triage — but they are still bugs, and 1, 2 and 3 are on the most ordinary
-query patterns there are.
+Findings 9, 10, 13, 14, 21–23 all produce requests that DynamoDB will reject.
+Those are loud failures, not silent ones — verified end-to-end against a real
+DynamoDB server implementation (see the validation section), which rejected every
+one of them while accepting every control. Loud is easier to triage, but they are
+still bugs, and 1, 2 and 3 sit on the most ordinary query patterns there are.
 
 Per `AGENTS.md`, every change must be reviewed and approved by a human before
 being submitted upstream, and any AI involvement must be disclosed in the PR

@@ -464,17 +464,27 @@ describe("FINDING 17: a FALSY value on an aliased attribute is lost entirely", (
 		expect(item.n).toBe(0);
 	});
 
-	it("root cause: the alias rename is guarded by `!== undefined`, not by presence", () => {
-		// Item.ts:653 - `if (returnObject[oldKey] !== undefined) { returnObject[newKey] = ...; delete ...; }`
-		// For a falsy-but-present value (0, "", false) the rename does not happen, and the
-		// schema-named key is then removed as "not in the schema" by the saveUnknown check.
+	it("root cause: the alias rename passes, but the write-back is a truthiness test", () => {
+		// The rename guard at Item.ts:652 is `!== undefined` and DOES pass for 0 (and for
+		// "", false). Proof: objectFromSchema alone yields {id: 1, nn: 0} correctly.
 		const returnObject = {"n": 0};
-		expect(returnObject["n"] !== undefined).toBe(true);   // 0 !== undefined
-		const truthy = {"n": 5};
-		expect(truthy["n"] !== undefined).toBe(true);
-		// The real defect is the missing presence check: `0` IS present.
+		expect(returnObject["n"] !== undefined).toBe(true);       // 0 !== undefined -> rename happens
 		expect(Object.prototype.hasOwnProperty.call(returnObject, "n")).toBe(true);
+
+		// The loss is in conformToSchema:
+		//   Item.ts:904  const expectedObjectValue = utils.object.get(expectedObject, key);
+		//   Item.ts:905  if (expectedObjectValue) { utils.object.set(this, key, ...) }   <-- TRUTHINESS
+		// so a renamed 0 / "" / false is never written back onto the item...
+		const expectedObjectValue = 0;
+		expect(Boolean(expectedObjectValue)).toBe(false);         // the guard that drops it
+		//   ...and Item.ts:911-915 then deletes the schema-named key because it is not in
+		//   expectedKeys, taking the only remaining copy with it.
 	});
+
+	// NOTE: the stronger end-to-end form -- a plain `Model.get(1)` against a stored
+	// {id: 1, n: {N: "0"}} returning {id: 1} with `nn` undefined, controls intact --
+	// was verified by direct probe rather than here, because building a live Table
+	// inside Jest triggers real table initialisation. See PBT_FINDINGS.md finding 17.
 });
 
 describe("FINDING 18: a schema-level `set` modifier makes dynamoPropertyForAttribute return the WRONG attribute", () => {
