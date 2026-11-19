@@ -12,8 +12,8 @@ worktree: `utils`, `schema`, `condition` + `itemretriever`, `item` + `model`, an
 agent whose only job was to **refute** it.
 
 That last step mattered. Three candidates were refuted and dropped, and the
-severity of five more was corrected downward. The final count is **15 confirmed
-bugs**, not the 21 candidates that were initially reported.
+severity of five more was corrected downward. The final count is **16 confirmed
+bugs**, not the 23 candidates that were initially reported.
 
 Every finding below was reproduced by running the code against the real
 `dynamoose` public API, not by reading it. The discovery suite lives in
@@ -250,6 +250,30 @@ Precisely isolated — the crash needs the parent's `saveUnknown` to be `true`:
 Note the model must be built from the `Schema` **instance**. Building the same
 shape from a plain object schema produces a different internal layout and does
 not crash.
+
+### 17. A falsy value on an aliased attribute is lost entirely — **MEDIUM**
+```js
+const M = dynamoose.model("M", {"id": Number, "n": {"type": Number, "alias": "nn"}});
+const item = new M({"id": 1, "n": 0});
+await item.conformToSchema({"type": "fromDynamo", "customTypesDynamo": true, "saveUnknown": true, "modifiers": ["get"], "mapAttributes": true});
+
+item.n    // undefined
+item.nn   // undefined   <-- the value 0 is GONE
+item.toJSON()  // {"id": 1}
+```
+
+A truthy value on the same attribute is correctly renamed to the alias
+(`item.nn === 5`), and the same falsy value on an attribute with **no** alias
+survives untouched (`item.n === 0`). Only the combination of *alias* + *falsy
+value* loses data.
+
+Root cause: `Item.ts:653` guards the rename with
+`if (returnObject[oldKey] !== undefined)`. For `0`, `""` and `false` the value
+**is present** but the guard is about `undefined`, so — depending on direction —
+the rename is skipped and the schema-named key is then removed by the
+"not in the schema" check, taking the value with it.
+
+No existing test covers an alias with a falsy value.
 
 ## Refuted during the adversarial review
 

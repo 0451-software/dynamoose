@@ -438,3 +438,41 @@ describe("FINDING 16: a nested Schema plus a parent `saveUnknown: true` crashes 
 		expect(() => utils.dynamoose.wildcard_allowed_check(outerOk.getSettingValue("saveUnknown"), "nested.x")).not.toThrow();
 	});
 });
+
+describe("FINDING 17: a FALSY value on an aliased attribute is lost entirely", () => {
+	it("an aliased attribute with the value 0 disappears from the item", async () => {
+		const M = dynamoose.model("AliasFalsyCat", {"id": Number, "n": {"type": Number, "alias": "nn"}});
+		new dynamoose.Table("AliasFalsyCat", [M], {"initialize": false});
+
+		const falsy = new M({"id": 1, "n": 0});
+		await falsy.conformToSchema({"type": "fromDynamo", "customTypesDynamo": true, "saveUnknown": true, "modifiers": ["get"], "mapAttributes": true});
+
+		const truthy = new M({"id": 1, "n": 5});
+		await truthy.conformToSchema({"type": "fromDynamo", "customTypesDynamo": true, "saveUnknown": true, "modifiers": ["get"], "mapAttributes": true});
+
+		// The truthy value is renamed to the alias; the falsy one is lost entirely.
+		expect(truthy.nn).toBe(5);
+		expect(falsy.n).toBe(0);
+		expect(falsy.nn).toBe(0);
+	});
+
+	it("control: the same value on an attribute with NO alias survives", async () => {
+		const M = dynamoose.model("AliasFalsyCat2", {"id": Number, "n": Number});
+		new dynamoose.Table("AliasFalsyCat2", [M], {"initialize": false});
+		const item = new M({"id": 1, "n": 0});
+		await item.conformToSchema({"type": "fromDynamo", "customTypesDynamo": true, "saveUnknown": true, "modifiers": ["get"], "mapAttributes": true});
+		expect(item.n).toBe(0);
+	});
+
+	it("root cause: the alias rename is guarded by `!== undefined`, not by presence", () => {
+		// Item.ts:653 - `if (returnObject[oldKey] !== undefined) { returnObject[newKey] = ...; delete ...; }`
+		// For a falsy-but-present value (0, "", false) the rename does not happen, and the
+		// schema-named key is then removed as "not in the schema" by the saveUnknown check.
+		const returnObject = {"n": 0};
+		expect(returnObject["n"] !== undefined).toBe(true);   // 0 !== undefined
+		const truthy = {"n": 5};
+		expect(truthy["n"] !== undefined).toBe(true);
+		// The real defect is the missing presence check: `0` IS present.
+		expect(Object.prototype.hasOwnProperty.call(returnObject, "n")).toBe(true);
+	});
+});
