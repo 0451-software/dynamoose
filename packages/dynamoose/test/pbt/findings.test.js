@@ -151,7 +151,7 @@ describe("FINDING 6: comparisonChart is keyed by array index for grouped conditi
 		"name": {"type": String, "index": {"type": "global"}},
 		"age": Number
 	});
-	new dynamoose.Table("ChartCat", [Model]);
+	new dynamoose.Table("ChartCat", [Model], {"initialize": false});
 
 	it("a grouped condition produces a chart entry keyed by the array index", async () => {
 		const condition = new dynamoose.Condition("id").eq(1).parenthesis((c) => c.where("age").eq(2));
@@ -176,7 +176,7 @@ describe("FINDING 7: a hash-key condition inside a parenthesis group breaks the 
 		"age": Number,
 		"color": String
 	});
-	new dynamoose.Table("GroupCat", [Model]);
+	new dynamoose.Table("GroupCat", [Model], {"initialize": false});
 
 	it("throws when the hash key lives inside a group and no other condition is present", async () => {
 		const query = Model.query().parenthesis((c) => c.where("id").eq(1)).using("nameIndex");
@@ -203,7 +203,7 @@ describe("FINDING 8: ANY or() in a query crashes the request builder", () => {
 		"name": {"type": String, "index": {"type": "global"}},
 		"age": Number
 	});
-	new dynamoose.Table("OrCat", [Model]);
+	new dynamoose.Table("OrCat", [Model], {"initialize": false});
 
 	it("throws a TypeError instead of building a request", async () => {
 		const query = Model.query("id").eq(1).or().where("age").eq(2);
@@ -280,7 +280,7 @@ describe("FINDING 12: a range-key condition using an operator DynamoDB rejects i
 		"id": Number,
 		"sk": {"type": Number, "rangeKey": true}
 	});
-	new dynamoose.Table("RangeOpCat", [RangeModel]);
+	new dynamoose.Table("RangeOpCat", [RangeModel], {"initialize": false});
 
 	it("`in()` on the range key is moved into the KeyConditionExpression", async () => {
 		const request = await RangeModel.query("id").eq(1).where("sk").in([1, 2]).getRequest();
@@ -411,7 +411,7 @@ describe("FINDING 16: a nested Schema plus a parent `saveUnknown: true` crashes 
 		const inner = new dynamoose.Schema({"a": String}, {"saveUnknown": true});
 		const outer = new dynamoose.Schema({"nested": inner}, {"saveUnknown": true});
 		const M = dynamoose.model("NestedSaveUnknownCat", outer);
-		new dynamoose.Table("NestedSaveUnknownCat", [M]);
+		new dynamoose.Table("NestedSaveUnknownCat", [M], {"initialize": false});
 
 		let error = null;
 		try {
