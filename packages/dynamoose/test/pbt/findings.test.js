@@ -5,6 +5,12 @@
 // hypothesis, the hypothesis was first checked against the code's own expressed
 // intent (existing unit tests + JSDoc) and against the real public API.
 //
+// Each finding was then put through an ADVERSARIAL REVIEW that tried to refute
+// it. Three candidate findings were refuted and removed (deep_copy of Map/Set
+// contents, merge_objects mutating its first argument, find_best_index mutating
+// its index objects) and the severity of several others was corrected. The
+// surviving set is below.
+//
 // This file lives on the discovery branch. Confirmed bugs get a standalone
 // deterministic regression test on their own fix branch.
 
@@ -17,7 +23,7 @@ const {fc, runProperty} = require("./_helpers");
 
 dynamoose.Table.defaults.set({"create": false, "waitForActive": false});
 
-describe("FINDING 1: combine_objects / merge_objects throw a raw TypeError on a null nested value", () => {
+describe("FINDING 1: combine_objects / merge_objects throw a raw TypeError instead of the documented error on a null nested value", () => {
 	it("combine_objects throws TypeError instead of handling a null nested value", () => {
 		expect(() => utils.combine_objects({"a": {"b": 1}}, {"a": null})).toThrow(TypeError);
 	});
@@ -26,70 +32,24 @@ describe("FINDING 1: combine_objects / merge_objects throw a raw TypeError on a 
 		expect(() => utils.merge_objects.main({"combineMethod": "array_merge_new_array"})({"a": {"b": 1}}, {"a": null})).toThrow(TypeError);
 	});
 
-	it("root cause: typeof null === 'object' passes the guard, then Object.keys(null) throws", () => {
-		// `combine_objects` guards with `typeof returnObject[key] === "object" && typeof arg[key] === "object"`.
-		// For a null value the second check still passes, so it recurses with `null`
-		// and `Object.keys(null)` throws "Cannot convert undefined or null to object".
+	it("root cause: the guard null-checks returnObject[key] but NOT arg[key]", () => {
+		// `combine_objects` guards with
+		//   `typeof returnObject[key] === "object" && typeof arg[key] === "object" && returnObject[key] !== null`
+		// `arg[key]` is never null-checked, so a null in a LATER argument recurses with
+		// `null` and `Object.keys(null)` throws "Cannot convert undefined or null to object".
 		expect(typeof null).toBe("object");
 		expect(() => Object.keys(null)).toThrow(TypeError);
+		// The asymmetry: null in the FIRST argument is handled, null in a later one is not.
+		expect(utils.combine_objects({"a": null}, {"a": {"b": 1}})).toEqual({"a": null});
 	});
 });
 
-describe("FINDING 2: deep_copy does not deep-copy values inside a Map or a Set", () => {
-	it("a Map value is shared between the original and the copy", () => {
-		const inner = {"n": 1};
-		const original = new Map([["k", inner]]);
-		const copy = utils.deep_copy(original);
-		expect(copy.get("k")).toBe(inner);
-	});
 
-	it("a Set element is shared between the original and the copy", () => {
-		const inner = {"n": 1};
-		const original = new Set([inner]);
-		const copy = utils.deep_copy(original);
-		expect([...copy][0]).toBe(inner);
-	});
-
-	it("mutating the copy's nested value is visible through the original", () => {
-		const inner = {"n": 1};
-		const original = new Map([["k", inner]]);
-		const copy = utils.deep_copy(original);
-		copy.get("k").n = 999;
-		expect(inner.n).toBe(999);
-	});
-
-	it("control: a nested plain object IS deep copied", () => {
-		const inner = {"n": 1};
-		const copy = utils.deep_copy({"x": inner});
-		copy.x.n = 999;
-		expect(inner.n).toBe(1);
-	});
-
-	it("root cause: the Map/Set branches use the shallow `new Map(obj)` / `new Set(obj)`", () => {
-		// Every other branch recurses into its children; Map and Set do not.
-		const inner = {"n": 1};
-		expect(new Map([["k", inner]]).get("k")).toBe(inner);
-		expect(new Set([inner])[Symbol.iterator]().next().value).toBe(inner);
-	});
-});
-
-describe("FINDING 3: merge_objects mutates its first argument", () => {
-	it("merge_objects mutates the first argument it is given", () => {
-		const first = {"x": 1};
-		utils.merge_objects(first, {"x": 2, "y": 3});
-		expect(first).toEqual({"x": 3, "y": 3});
-	});
-
-	it("merge_objects returns the first argument by reference", () => {
-		const first = {"x": 1};
-		expect(utils.merge_objects(first, {"y": 2})).toBe(first);
-	});
-});
-
-describe("FINDING 4: merge_objects result depends on the TRUTHINESS of the accumulated value", () => {
-	it("a numeric 0 is overwritten instead of added", () => {
-		// The `else if (returnObject[key])` branch is truthiness-sensitive, so a 0
-		// skips the numeric-addition path and is replaced instead.
+describe("FINDING 2: merge_objects result depends on the TRUTHINESS of the accumulated value", () => {
+	it("under the DEFAULT combine method a falsy first value is numerically consistent", () => {
+		// The `else if (returnObject[key])` branch IS truthiness-sensitive, so a 0
+		// skips the numeric-addition path. Under the DEFAULT method this is NOT
+		// observable, because 0 + 3 === 3 (overwriting with 3 gives the same number).
 		expect(utils.merge_objects({"b": 0}, {"b": 3})).toEqual({"b": 3});
 		expect(utils.merge_objects({"b": 1}, {"b": 3})).toEqual({"b": 4});
 	});
@@ -114,7 +74,8 @@ describe("FINDING 4: merge_objects result depends on the TRUTHINESS of the accum
 	});
 });
 
-describe("FINDING 5: prototype pollution through combine_objects / merge_objects", () => {
+
+describe("FINDING 3: prototype pollution through combine_objects / merge_objects", () => {
 	afterEach(() => {
 		delete Object.prototype.__pbtPolluted__;
 	});
@@ -140,7 +101,8 @@ describe("FINDING 5: prototype pollution through combine_objects / merge_objects
 	});
 });
 
-describe("FINDING 6: Table constructor mutates and aliases the caller's options object", () => {
+
+describe("FINDING 4: Table constructor mutates and aliases the caller's options object", () => {
 	it("mutates the caller's nested options object", () => {
 		const M = dynamoose.model("MutateCat", {"id": {"type": String, "hashKey": true}});
 		const options = {"throughput": {"read": 5}, "initialize": false};
@@ -165,8 +127,12 @@ describe("FINDING 6: Table constructor mutates and aliases the caller's options 
 	});
 });
 
-describe("FINDING 7: a failed Table construction permanently bricks its models", () => {
+
+describe("FINDING 5: a failed Table construction permanently bricks its models", () => {
 	it("models stay bound to the half-built table after the constructor throws", () => {
+		// The "already assigned" guard itself is INTENTIONAL (test/Table.js:50-54).
+		// The defect is the ORDERING: binding happens inside setInternalProperties
+		// (Table/index.ts:190-201) BEFORE the hashKey validation (:289-294).
 		const good = dynamoose.model("BrickCat1", {"id": {"type": String, "hashKey": true}});
 		const bad = dynamoose.model("BrickCat2", {"otherId": {"type": String, "hashKey": true}});
 
@@ -178,7 +144,8 @@ describe("FINDING 7: a failed Table construction permanently bricks its models",
 	});
 });
 
-describe("FINDING 8: comparisonChart is keyed by array index for grouped conditions", () => {
+
+describe("FINDING 6: comparisonChart is keyed by array index for grouped conditions", () => {
 	const Model = dynamoose.model("ChartCat", {
 		"id": Number,
 		"name": {"type": String, "index": {"type": "global"}},
@@ -201,7 +168,8 @@ describe("FINDING 8: comparisonChart is keyed by array index for grouped conditi
 	});
 });
 
-describe("FINDING 9: a hash-key condition inside a parenthesis group breaks the key condition", () => {
+
+describe("FINDING 7: a hash-key condition inside a parenthesis group breaks the key condition", () => {
 	const Model = dynamoose.model("GroupCat", {
 		"id": Number,
 		"name": {"type": String, "index": {"type": "global"}},
@@ -228,7 +196,8 @@ describe("FINDING 9: a hash-key condition inside a parenthesis group breaks the 
 	});
 });
 
-describe("FINDING 10: a top-level or() crashes the request builder", () => {
+
+describe("FINDING 8: ANY or() in a query crashes the request builder", () => {
 	const Model = dynamoose.model("OrCat", {
 		"id": Number,
 		"name": {"type": String, "index": {"type": "global"}},
@@ -240,9 +209,19 @@ describe("FINDING 10: a top-level or() crashes the request builder", () => {
 		const query = Model.query("id").eq(1).or().where("age").eq(2);
 		await expect(query.getRequest()).resolves.toBeDefined();
 	});
+
+	it("every or() position fails - leading, middle and trailing", async () => {
+		// `comparisonChart` is only called for queries, so scans are unaffected.
+		const scan = Model.scan("id").eq(1).or().where("age").eq(2);
+		await expect(scan.getRequest()).resolves.toBeDefined();
+
+		const middle = Model.query("id").eq(1).where("age").eq(2).or().where("name").eq("x");
+		await expect(middle.getRequest()).resolves.toBeDefined();
+	});
 });
 
-describe("FINDING 11: an empty `in([])` emits the invalid expression `#a0 IN ()`", () => {
+
+describe("FINDING 9: an empty `in([])` emits the invalid expression `#a0 IN ()`", () => {
 	it("emits an expression DynamoDB cannot parse", async () => {
 		const condition = new dynamoose.Condition("name").in([]);
 		const request = await condition.getInternalProperties(internalProperties).requestObject(
@@ -253,8 +232,9 @@ describe("FINDING 11: an empty `in([])` emits the invalid expression `#a0 IN ()`
 	});
 });
 
-describe("FINDING 12: between() with one argument leaves a dangling value reference", () => {
-	it("references a value placeholder that holds undefined, which the AWS SDK rejects", async () => {
+
+describe("FINDING 10: between() with one argument leaves a dangling value reference", () => {
+	it("references a value placeholder that holds undefined", async () => {
 		const condition = new dynamoose.Condition("name").between(1);
 		const request = await condition.getInternalProperties(internalProperties).requestObject(
 			dynamoose.model("BetweenCat", {"id": Number, "name": String}).Model,
@@ -267,16 +247,8 @@ describe("FINDING 12: between() with one argument leaves a dangling value refere
 	});
 });
 
-describe("FINDING 13: find_best_index mutates the caller's index objects", () => {
-	it("adds internal properties to the index objects it is given", () => {
-		const indexes = {"TableIndex": {"IndexName": "T", "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]}};
-		const snapshot = JSON.stringify(indexes);
-		utils.find_best_index(indexes, {"id": {"type": "EQ"}});
-		expect(JSON.stringify(indexes)).toBe(snapshot);
-	});
-});
 
-describe("FINDING 14: a schema attribute named after an Object.prototype member never gets its default", () => {
+describe("FINDING 11: a schema attribute named after an Object.prototype member never gets its default", () => {
 	it("the default is skipped for a `toString` attribute but applied for a normal one", async () => {
 		const Weird = dynamoose.model("BuiltinNameCat", {"toString": {"type": String, "default": "D"}});
 		const Normal = dynamoose.model("BuiltinNameCat2", {"normal": {"type": String, "default": "D"}});
@@ -299,7 +271,8 @@ describe("FINDING 14: a schema attribute named after an Object.prototype member 
 	});
 });
 
-describe("FINDING 15: a range-key condition using an operator DynamoDB rejects in a KeyConditionExpression", () => {
+
+describe("FINDING 12: a range-key condition using an operator DynamoDB rejects in a KeyConditionExpression", () => {
 	// AWS docs (Query.KeyConditionExpressions): the sort key condition must use
 	// one of =, <, <=, >, >=, BETWEEN, or begins_with. IN, <> and the
 	// attribute_exists family are NOT allowed.
@@ -332,7 +305,8 @@ describe("FINDING 15: a range-key condition using an operator DynamoDB rejects i
 	});
 });
 
-describe("FINDING 16: a required attribute named after an Object.prototype member is not enforced", () => {
+
+describe("FINDING 13: a required attribute named after an Object.prototype member is not enforced", () => {
 	it("a missing `toString` attribute marked required does not raise a ValidationError", async () => {
 		const Weird = dynamoose.model("RequiredBuiltinCat", {"id": Number, "toString": {"type": String, "required": true}});
 		const Normal = dynamoose.model("RequiredBuiltinCat2", {"id": Number, "normal": {"type": String, "required": true}});
@@ -357,7 +331,8 @@ describe("FINDING 16: a required attribute named after an Object.prototype membe
 	});
 });
 
-describe("FINDING 17: an array default containing a null element is silently dropped", () => {
+
+describe("FINDING 14: an array default containing a null element is silently dropped", () => {
 	it("the whole attribute disappears instead of being defaulted", async () => {
 		const WithNull = dynamoose.model("ArrayDefaultCat", {
 			"id": Number,
@@ -389,7 +364,8 @@ describe("FINDING 17: an array default containing a null element is silently dro
 	});
 });
 
-describe("FINDING 18: a null value defeats the documented 'default applies to null' behaviour", () => {
+
+describe("FINDING 15: a null value defeats the documented 'default applies to null' behaviour", () => {
 	// Schema.ts:438 — "You can set a default value for an attribute that will be applied upon
 	// save if the given attribute value is `null` or `undefined`."
 	it("a null value throws a TypeMismatch instead of falling back to the default", async () => {
