@@ -3518,6 +3518,21 @@ describe("Model", () => {
 					});
 				});
 
+				it("Should send correct params to updateItem when the update object uses an ALIASED non-key attribute", async () => {
+					// Model.update read the mapped value back by the alias the caller used,
+					// but objectFromSchema had already renamed it to the DynamoDB name, so
+					// the value came back undefined and the attribute was silently dropped.
+					User = dynamoose.model("User", {"pk": {"type": String, "alias": "email"}, "name": {"type": String, "alias": "userName"}});
+					new dynamoose.Table("User", [User]);
+
+					updateItemFunction = () => Promise.resolve({});
+					await callType.func(User).bind(User)({"email": "john@john.com"}, {"userName": "John"});
+					expect(updateItemParams).toBeInstanceOf(Object);
+					expect(updateItemParams.UpdateExpression).toBe("SET #a0 = :v0");
+					expect(updateItemParams.ExpressionAttributeNames).toEqual({"#a0": "name"});
+					expect(updateItemParams.ExpressionAttributeValues).toEqual({":v0": {"S": "John"}});
+				});
+
 				it("Should send correct params to updateItem if we use an aliased attribute for the key in a single update object", async () => {
 					User = dynamoose.model("User", {"pk": {"type": String, "alias": "email"}, "name": String});
 					new dynamoose.Table("User", [User]);
