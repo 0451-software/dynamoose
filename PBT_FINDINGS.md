@@ -12,8 +12,8 @@ worktree: `utils`, `schema`, `condition` + `itemretriever`, `item` + `model`, an
 agent whose only job was to **refute** it.
 
 That last step mattered. Three candidates were refuted and dropped, and the
-severity of five more was corrected downward. The final count is **14 confirmed
-bugs**, not the 19 candidates that were initially reported.
+severity of five more was corrected downward. The final count is **15 confirmed
+bugs**, not the 21 candidates that were initially reported.
 
 Every finding below was reproduced by running the code against the real
 `dynamoose` public API, not by reading it. The discovery suite lives in
@@ -218,6 +218,38 @@ new dynamoose.Condition("name").between(1)
 AWS SDK's low-level serializer silently drops the undefined value, so DynamoDB
 receives a `BETWEEN` with a missing bound and rejects it with a service-side
 validation error. Dynamoose itself does not crash.
+
+### 16. A nested `Schema` plus a parent `saveUnknown: true` crashes on save — **MEDIUM**
+```js
+const inner = new dynamoose.Schema({"a": String}, {"saveUnknown": true});
+const outer = new dynamoose.Schema({"nested": inner}, {"saveUnknown": true});
+const M = dynamoose.model("M", outer);          // model built from the Schema INSTANCE
+await new M({"id": "1", "nested": {"a": "x", "unknownKey": "y"}}).save();
+// TypeError: key.split is not a function
+//   at wildcard_allowed_check (dynamoose-utils/dist/wildcard_allowed_check.js:6:34)
+```
+
+Root cause: `Schema.ts:1065` merges a nested `Schema`'s settings into the parent's
+with `merge_objects.main({combineMethod: "array_merge_new_array"})`. The parent's
+`saveUnknown: true` is a **boolean**, and it is truthy, so the merge takes the
+array-merge branch and produces the malformed `[true, ["nested.**"]]` instead of
+`["nested.**"]`. `wildcard_allowed_check` then calls `key.split(...)` on the
+boolean.
+
+This is the same truthiness defect as finding 12, reached through a different
+call site.
+
+Precisely isolated — the crash needs the parent's `saveUnknown` to be `true`:
+
+| parent `saveUnknown` | merged value | crashes? |
+|---|---|---|
+| `true` | `[true, ["nested.**"]]` | yes |
+| `false` | `["nested.**"]` | no |
+| `["x"]` | `["x", "nested.**"]` | no |
+
+Note the model must be built from the `Schema` **instance**. Building the same
+shape from a plain object schema produces a different internal layout and does
+not crash.
 
 ## Refuted during the adversarial review
 
