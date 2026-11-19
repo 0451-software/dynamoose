@@ -207,6 +207,9 @@ export class Condition extends InternalPropertiesClass<ConditionInternalProperti
 								expression = `${keys.name} ${condition.type === "EQ" ? "=" : "<>"} ${keys.value}`;
 								break;
 							case "IN":
+								if (Array.isArray(value) && value.length === 0) {
+									throw new CustomError.InvalidParameter("The value passed to `in` must be a non-empty array. An empty array produces the invalid expression `IN ()`, which DynamoDB rejects.");
+								}
 								delete object.ExpressionAttributeValues[keys.value];
 								expression = `${keys.name} IN (${value.map((_v: any, i: number) => `${keys.value}_${i + 1}`).join(", ")})`;
 								await Promise.all(value.map(async (valueItem: any, i: number) => {
