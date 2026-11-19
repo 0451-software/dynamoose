@@ -275,3 +275,59 @@ describe("FINDING 13: find_best_index mutates the caller's index objects", () =>
 		expect(JSON.stringify(indexes)).toBe(snapshot);
 	});
 });
+
+describe("FINDING 14: a schema attribute named after an Object.prototype member never gets its default", () => {
+	it("the default is skipped for a `toString` attribute but applied for a normal one", async () => {
+		const Weird = dynamoose.model("BuiltinNameCat", {"toString": {"type": String, "default": "D"}});
+		const Normal = dynamoose.model("BuiltinNameCat2", {"normal": {"type": String, "default": "D"}});
+
+		const weird = await Item.objectFromSchema({}, Weird.Model, {"type": "toDynamo", "typeCheck": false, "defaults": true, "mapAttributes": true});
+		const normal = await Item.objectFromSchema({}, Normal.Model, {"type": "toDynamo", "typeCheck": false, "defaults": true, "mapAttributes": true});
+
+		expect(normal).toEqual({"normal": "D"});
+		expect(weird).toEqual({"toString": "D"});
+	});
+
+	it("root cause: utils.object.get returns the INHERITED function, so the value is not 'undefined'", () => {
+		// `Item.objectFromSchema` reads the current value with `utils.object.get(returnObject, key)`.
+		// For a key that exists on Object.prototype that read returns the inherited
+		// function instead of `undefined`, so `defaultCheck` sees a defined value and
+		// never applies the default.
+		expect(typeof utils.object.get({}, "toString")).toBe("function");
+		expect(utils.object.get({}, "toString") === undefined).toBe(false);
+		expect(utils.object.get({}, "aNameThatIsNotOnObjectPrototype")).toBe(undefined);
+	});
+});
+
+describe("FINDING 15: a range-key condition using an operator DynamoDB rejects in a KeyConditionExpression", () => {
+	// AWS docs (Query.KeyConditionExpressions): the sort key condition must use
+	// one of =, <, <=, >, >=, BETWEEN, or begins_with. IN, <> and the
+	// attribute_exists family are NOT allowed.
+	const RangeModel = dynamoose.model("RangeOpCat", {
+		"id": Number,
+		"sk": {"type": Number, "rangeKey": true}
+	});
+	new dynamoose.Table("RangeOpCat", [RangeModel]);
+
+	it("`in()` on the range key is moved into the KeyConditionExpression", async () => {
+		const request = await RangeModel.query("id").eq(1).where("sk").in([1, 2]).getRequest();
+		expect(request.KeyConditionExpression).not.toMatch(/\bIN\b/);
+	});
+
+	it("`not().eq()` (<>) on the range key is moved into the KeyConditionExpression", async () => {
+		const request = await RangeModel.query("id").eq(1).where("sk").not().eq(5).getRequest();
+		expect(request.KeyConditionExpression).not.toMatch(/<>/);
+	});
+
+	it("`not().exists()` (attribute_not_exists) on the range key is moved into the KeyConditionExpression", async () => {
+		const request = await RangeModel.query("id").eq(1).where("sk").not().exists().getRequest();
+		expect(request.KeyConditionExpression).not.toMatch(/attribute_not_exists/);
+	});
+
+	it("control: `exists()` and `not().contains()` stay in the FilterExpression", async () => {
+		const exists = await RangeModel.query("id").eq(1).where("sk").exists().getRequest();
+		expect(exists.KeyConditionExpression).toBe("#qha = :qhv");
+		const notContains = await RangeModel.query("id").eq(1).where("sk").not().contains(2).getRequest();
+		expect(notContains.KeyConditionExpression).toBe("#qha = :qhv");
+	});
+});
