@@ -401,3 +401,40 @@ describe("NOT A BUG (documentation inaccuracy): the JSDoc says a default applies
 		expect(result).toEqual({"id": {"N": "1"}, "age": {"N": "5"}});
 	});
 });
+
+describe("FINDING 16: a nested Schema plus a parent `saveUnknown: true` crashes on save", () => {
+	it("saving an item built from such a Schema throws a raw TypeError", async () => {
+		// `Schema.ts:1065` merges a nested Schema's settings into the parent's with
+		// `merge_objects.main({combineMethod: "array_merge_new_array"})`. The parent's
+		// `saveUnknown: true` (a boolean) is truthy, so the merge produces the
+		// malformed `[true, ["nested.**"]]` instead of `["nested.**"]`.
+		const inner = new dynamoose.Schema({"a": String}, {"saveUnknown": true});
+		const outer = new dynamoose.Schema({"nested": inner}, {"saveUnknown": true});
+		const M = dynamoose.model("NestedSaveUnknownCat", outer);
+		new dynamoose.Table("NestedSaveUnknownCat", [M]);
+
+		let error = null;
+		try {
+			await new M({"id": "1", "nested": {"a": "x", "unknownKey": "y"}}).save();
+		} catch (e) {
+			error = e;
+		}
+		expect(error).toBe(null);
+	});
+
+	it("root cause: the merged saveUnknown setting is malformed", () => {
+		const inner = new dynamoose.Schema({"a": String}, {"saveUnknown": true});
+		const outer = new dynamoose.Schema({"nested": inner}, {"saveUnknown": true});
+		const merged = outer.getSettingValue("saveUnknown");
+		// The expected shape is a flat list of path patterns.
+		expect(merged).toEqual(["nested.**"]);
+	});
+
+	it("control: a parent saveUnknown of false, or an array of paths, does not crash", () => {
+		const utils = require("../../dist/utils").default;
+		const innerOk = new dynamoose.Schema({"a": String}, {"saveUnknown": true});
+		const outerOk = new dynamoose.Schema({"nested": innerOk}, {"saveUnknown": false});
+		expect(outerOk.getSettingValue("saveUnknown")).toEqual(["nested.**"]);
+		expect(() => utils.dynamoose.wildcard_allowed_check(outerOk.getSettingValue("saveUnknown"), "nested.x")).not.toThrow();
+	});
+});
