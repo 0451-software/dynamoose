@@ -271,3 +271,40 @@ describe("Condition", () => {
 		});
 	});
 });
+
+describe("Condition - between() arity (regression)", () => {
+	// DynamoDB's BETWEEN requires exactly two operands. With one argument the
+	// generated expression references a value placeholder that is never defined,
+	// and the SDK serializer drops it, so the request is invalid on the wire.
+	const model = {
+		"getInternalProperties": () => ({
+			"table": () => ({
+				"getInternalProperties": () => ({
+					"instance": Instance.default
+				})
+			}),
+			"schemaForObject": () => new dynamoose.Schema({"id": String, "age": Number}),
+			"dynamoPropertyForAttribute": (key) => key
+		})
+	};
+
+	const build = (condition) => condition.getInternalProperties(internalProperties).requestObject(model, {"conditionString": "ConditionExpression", "conditionStringType": "string"});
+
+	it("Should reject between() with one argument", async () => {
+		await expect(build(new dynamoose.Condition().where("age").between(1))).rejects.toThrow(/between/u);
+	});
+
+	it("Should reject between() with zero arguments", async () => {
+		await expect(build(new dynamoose.Condition().where("age").between())).rejects.toThrow(/between/u);
+	});
+
+	it("Should reject between() with three arguments", async () => {
+		await expect(build(new dynamoose.Condition().where("age").between(1, 2, 3))).rejects.toThrow(/between/u);
+	});
+
+	it("Should still accept exactly two arguments (control)", async () => {
+		const result = await build(new dynamoose.Condition().where("age").between(13, 18));
+		expect(result.ConditionExpression).toBe("#a0 BETWEEN :v0_1 AND :v0_2");
+		expect(result.ExpressionAttributeValues).toEqual({":v0_1": {"N": "13"}, ":v0_2": {"N": "18"}});
+	});
+});
