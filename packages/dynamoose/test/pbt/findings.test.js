@@ -331,3 +331,82 @@ describe("FINDING 15: a range-key condition using an operator DynamoDB rejects i
 		expect(notContains.KeyConditionExpression).toBe("#qha = :qhv");
 	});
 });
+
+describe("FINDING 16: a required attribute named after an Object.prototype member is not enforced", () => {
+	it("a missing `toString` attribute marked required does not raise a ValidationError", async () => {
+		const Weird = dynamoose.model("RequiredBuiltinCat", {"id": Number, "toString": {"type": String, "required": true}});
+		const Normal = dynamoose.model("RequiredBuiltinCat2", {"id": Number, "normal": {"type": String, "required": true}});
+
+		let weirdError = null;
+		try {
+			await new Weird({"id": 1}).toDynamo({"required": true});
+		} catch (e) {
+			weirdError = e;
+		}
+		let normalError = null;
+		try {
+			await new Normal({"id": 1}).toDynamo({"required": true});
+		} catch (e) {
+			normalError = e;
+		}
+
+		// The control must be rejected.
+		expect(normalError).not.toBe(null);
+		// The builtin-named attribute must be rejected too.
+		expect(weirdError).not.toBe(null);
+	});
+});
+
+describe("FINDING 17: an array default containing a null element is silently dropped", () => {
+	it("the whole attribute disappears instead of being defaulted", async () => {
+		const WithNull = dynamoose.model("ArrayDefaultCat", {
+			"id": Number,
+			"arr": {"type": Array, "schema": [String], "default": () => ["a", null]}
+		});
+		const WithoutNull = dynamoose.model("ArrayDefaultCat2", {
+			"id": Number,
+			"arr": {"type": Array, "schema": [String], "default": () => ["a", "b"]}
+		});
+
+		const withNull = await Item.objectFromSchema({"id": 1}, WithNull.Model, {"type": "toDynamo", "typeCheck": false, "defaults": true, "mapAttributes": true});
+		const withoutNull = await Item.objectFromSchema({"id": 1}, WithoutNull.Model, {"type": "toDynamo", "typeCheck": false, "defaults": true, "mapAttributes": true});
+
+		expect(withoutNull).toEqual({"id": 1, "arr": ["a", "b"]});
+		expect(withNull).toEqual({"id": 1, "arr": ["a", null]});
+	});
+
+	it("root cause: the 'is the default undefined' check inspects the ARRAY ELEMENTS", () => {
+		// Item.objectFromSchema computes
+		//   isDefaultValueUndefined = Array.isArray(defaultValue)
+		//     ? defaultValue.some((v) => typeof v === "undefined" || v === null)
+		//     : ...
+		// so a single null element makes the whole default look undefined and it is discarded.
+		const defaultValue = ["a", null];
+		const isDefaultValueUndefined = Array.isArray(defaultValue)
+			? defaultValue.some((v) => typeof v === "undefined" || v === null)
+			: typeof defaultValue === "undefined" || defaultValue === null;
+		expect(isDefaultValueUndefined).toBe(true);
+	});
+});
+
+describe("FINDING 18: a null value defeats the documented 'default applies to null' behaviour", () => {
+	// Schema.ts:438 — "You can set a default value for an attribute that will be applied upon
+	// save if the given attribute value is `null` or `undefined`."
+	it("a null value throws a TypeMismatch instead of falling back to the default", async () => {
+		const M = dynamoose.model("NullDefaultCat", {"id": Number, "age": {"type": Number, "default": 5}});
+
+		let error = null;
+		try {
+			await new M({"id": 1, "age": null}).toDynamo({"defaults": true});
+		} catch (e) {
+			error = e;
+		}
+		expect(error).toBe(null);
+	});
+
+	it("control: an ABSENT value does get the default", async () => {
+		const M = dynamoose.model("NullDefaultCat2", {"id": Number, "age": {"type": Number, "default": 5}});
+		const result = await new M({"id": 1}).toDynamo({"defaults": true});
+		expect(result).toEqual({"id": {"N": "1"}, "age": {"N": "5"}});
+	});
+});
