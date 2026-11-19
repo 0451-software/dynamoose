@@ -501,25 +501,47 @@ uses SameValueZero, so `[NaN].size === 1`.
 
 ## Server-level validation (second pass)
 
-An earlier draft of this report validated the "DynamoDB would reject this" claims by
-reading the AWS expression grammar. That is second-hand evidence. A second pass
-re-ran every contested request against a **real DynamoDB server implementation**
-(`dynalite`, a pure-JS DynamoDB) and let the server decide.
+Earlier drafts validated the "DynamoDB would reject this" claims by reading the
+AWS expression grammar. That is second-hand evidence. This pass sent every
+contested request to a **real DynamoDB server** and let it decide.
 
-Scripts: `validate-e2e.js`, `validate-e2e-2.js` (need a server on `:8002`).
+Two servers were used, and they agreed on every case:
 
-| Finding | Request sent | Server verdict |
+1. **DynamoDB Local** — AWS's own implementation (the authoritative one).
+2. **`dynalite`** — a pure-JS reimplementation, used first as a cross-check.
+
+### Running DynamoDB Local on this machine
+
+Two traps cost real time; both are fixed by flags, not by patches:
+
+```bash
+# Trap 1: the bundled native SQLite bridge needs the system libsqlite3
+#         (aarch64 build ships as libsqlite4java-linux-aarch64.so)
+# Trap 2: sqlite4java extracts that .so into java.io.tmpdir, and /tmp here is
+#         noexec -> "failed to map segment from shared object".
+#         Point java.io.tmpdir at an exec-capable directory.
+java -Djava.io.tmpdir=/opt/ddblocal/tmp \
+     -Djava.library.path=/opt/ddblocal/DynamoDBLocal_lib \
+     -jar DynamoDBLocal.jar -inMemory -port 8000
+```
+
+A `--add-needed libsqlite3.so.0` patch via `patchelf` was also needed on the
+bundled `.so` so the JVM loader resolves it. An earlier conclusion that
+"DynamoDB Local cannot run on aarch64" was **wrong** — it was the noexec tmpdir.
+
+### Results — real DynamoDB Local
+
+| Finding | Request sent | Verdict |
 |---|---|---|
-| F9 — `in([])` | `FilterExpression: "#a0 IN ()"` | **REJECTED** — `ValidationException: Syntax error; Expected "#", "(", ":", "_", or [a-zA-Z] but ")" found` |
+| F9 — `in([])` | `"#a0 IN ()"` | **REJECTED** — `ValidationException: Syntax error; Expected "#", "(", ":", "_", or [a-zA-Z] but ")" found` |
 | F10 — `between(1)` | `"#a0 BETWEEN :v0_1 AND :v0_2"` | **REJECTED** — `An expression attribute value used in expression is not defined; attribute value: :v0_2` |
 | F12a — `in()` on sort key | `"#qha = :qhv AND #qra IN (:qrv_1, :qrv_2)"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: IN` |
 | F12b — `not().eq()` on sort key | `"#qha = :qhv AND #qra <> :qrv"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: <>` |
 | F12c — `not().exists()` on sort key | `"#qha = :qhv AND attribute_not_exists (#qra)"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: attribute_not_exists` |
-| F13 — `>` on the partition key | `"#qha > :qhv"` | **REJECTED** — `Query key condition not supported` |
-| F23 — empty group | `"#a0 = :v0 AND AND #a1 = :v1"` | **REJECTED** — `Syntax error; Expected "(" or "NOT" but "A" found` |
-| F7b — grouped hash key (≥9 extra conditions) | `KeyConditionExpression: "#qha0 = :qhv0"` with `#qha0`/`:qhv0` absent | **REJECTED** — `An expression attribute name used in the document path is not defined; attribute name: #qha0` |
+| F13 — `>` on the partition key | `"#qha > :qhv"` | **REJECTED** — `ValidationException: Query key condition not supported` |
+| F23 — empty group | `"#a0 = :v0 AND AND #a1 = :v1"` | **REJECTED** — `Invalid FilterExpression: Syntax error; token: "AND", near: "AND AND #a1"` |
 
-**Controls — every one accepted**, which is what makes the rejections meaningful:
+**Every control was accepted**, which is what makes the rejections meaningful:
 
 | Control | Verdict |
 |---|---|
@@ -529,24 +551,31 @@ Scripts: `validate-e2e.js`, `validate-e2e-2.js` (need a server on `:8002`).
 | a plain `hash = AND range =` query | accepted |
 | a grouped condition in a **Scan** | accepted |
 
-Two corrections this pass forced:
+`dynalite` was run first and returned the same accept/reject split on all eleven
+cases, so the two independent implementations agree.
 
-1. **F23's emitted text varies by path.** Through `Model.scan()` the expression is
+### F7 variant B — proven client-side, not yet server-rejected
+
+Variant B emits `KeyConditionExpression: "#qha0 = :qhv0"` while `#qha0` and
+`:qhv0` are **absent** from `ExpressionAttributeNames`/`Values` (checked with
+`hasOwnProperty`, both `false`). A request that references an undefined
+expression attribute name cannot succeed, and `dynalite` rejects it with exactly
+`attribute name: #qha0 is not defined`.
+
+Against real DynamoDB Local it was **not** driven into that shape in this run: the
+corruption needs the reviewer's specific hash-only-GSI configuration plus 11
+conditions, and a model with a normally-shaped GSI emits a clean
+`"#qha = :qhv"` instead. So F7 rests on client-side proof plus one server's
+rejection — strong, but one notch below the seven above.
+
+### Two corrections this pass forced
+
+1. **F23's emitted text varies by path.** Through `Model.scan()` it is
    `"#a0 = :v0 AND AND #a1 = :v1"`; through a bare `Condition.requestObject` it is
-   `"#a0 = :v0 AND () AND #a1 = :v1"`. Both are invalid; the report previously
-   quoted only the second.
+   `"#a0 = :v0 AND () AND #a1 = :v1"`. Both are invalid and both are rejected.
 2. **F7 variant A (the client-side crash) is narrower than first stated.** It did
-   *not* reproduce when `.using()` named a real index whose key schema matches the
-   model. The crash needs a specific shape (a grouped key condition plus an index
-   whose key is not resolvable that way). Variant B — the placeholder corruption —
-   reproduces reliably and is server-rejected, so F7 stands on variant B. Variant A
-   should be described as "reproduces under narrower conditions", not "any grouped
-   hash key".
-
-**Caveat:** `dynalite` is a reimplementation, not AWS. A rejection is strong
-evidence of invalidity; an acceptance is weaker evidence of validity. The
-accept/reject split across controls and cases is consistent with the AWS grammar,
-which is the important signal.
+   not reproduce when `.using()` named a real index whose key schema matched the
+   model.
 
 ## Refuted during the adversarial review
 

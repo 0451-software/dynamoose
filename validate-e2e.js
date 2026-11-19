@@ -9,7 +9,7 @@
 const dynamoose = require("/workspace/source/dynamoose/packages/dynamoose/dist");
 const {DynamoDBClient, CreateTableCommand, DeleteTableCommand} = require("/workspace/source/dynamoose/node_modules/@aws-sdk/client-dynamodb");
 
-const ENDPOINT = "http://localhost:8002";
+const ENDPOINT = process.env.DDB_ENDPOINT || "http://localhost:8002";
 const raw = new DynamoDBClient({
 	endpoint: ENDPOINT,
 	region: "us-east-1",

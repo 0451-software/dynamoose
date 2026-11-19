@@ -5,7 +5,7 @@ const dynamoose = require("/workspace/source/dynamoose/packages/dynamoose/dist")
 const {DynamoDBClient} = require("/workspace/source/dynamoose/node_modules/@aws-sdk/client-dynamodb");
 const {QueryCommand, ScanCommand, CreateTableCommand, DeleteTableCommand} = require("/workspace/source/dynamoose/node_modules/@aws-sdk/client-dynamodb");
 
-const ENDPOINT = "http://localhost:8002";
+const ENDPOINT = process.env.DDB_ENDPOINT || "http://localhost:8002";
 const raw = new DynamoDBClient({endpoint: ENDPOINT, region: "us-east-1", credentials: {accessKeyId: "fake", secretAccessKey: "fake"}});
 dynamoose.aws.ddb.local(ENDPOINT);
 dynamoose.Table.defaults.set({"create": false, "waitForActive": false});
@@ -53,7 +53,7 @@ const Model = dynamoose.model(TABLE, {
 	["color", "name", "age", "color", "name", "age", "color", "name", "age"].forEach((attribute) => query.where(attribute).eq(1));
 	let request = null;
 	try {
-		request = await query.using("someIndex").getRequest();
+		request = await query.using("nameGlobalIndex").getRequest();
 	} catch (e) {
 		console.log("F7B  client-side crash:", e.constructor.name + ":", String(e.message).slice(0, 90));
 	}
