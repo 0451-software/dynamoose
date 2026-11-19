@@ -49,10 +49,11 @@ Two distinct failures, both reachable from the public `Query` API.
 entry is a nested array, and `Array.includes` is an exact match, so `findIndex`
 returns `-1` and the code dereferences `undefined`.
 
-```js
-Model.query("id").eq(1).parenthesis((c) => c.where("id").eq(2)).getRequest()
-// TypeError: Cannot read properties of undefined (reading 'includes')
-```
+**Scope caveat (corrected in the second pass):** this crash does *not* fire for
+every grouped key condition. It did not reproduce when `.using()` named a real
+index whose key schema matched the model. It needs a narrower shape — a grouped
+key condition plus an index whose key cannot be resolved that way. The
+corruption variant below is the reliable one, and it is what the finding rests on.
 
 *Corruption* — `#a1` is a prefix of `#a10`, so `findIndex` matches the wrong
 entry and the subsequent `replace` turns `#a10` into `#qha0`, emitting a
@@ -343,7 +344,13 @@ throws `Index can't be found for query.` — the hash-key equality is invisible 
 ```js
 new Condition().where("name").eq(1).parenthesis((c) => c).where("id").eq(2);
 // ConditionExpression: "#a0 = :v0 AND () AND #a1 = :v1"
+
+Model.scan().where("name").eq("x").parenthesis((c) => c).where("age").eq(1).getRequest();
+// FilterExpression: "#a0 = :v0 AND AND #a1 = :v1"   <-- same defect, different text
 ```
+
+The exact emitted text depends on the path; both forms are invalid and a DynamoDB
+server rejects both.
 Root cause: `utils.object.clearEmpties` deletes the empty nested array from the
 `FilterExpression` array, leaving a hole, while both `AND` connectors survive
 (`Condition.ts:245-255`).
@@ -377,6 +384,56 @@ utils.unique_array_elements([1, NaN, 2]) // => [1, 2]  (the NaN is gone)
 Root cause: `unique_array_elements.ts:3` uses `obj.equals`, whose fast path is
 `a === b` — and `NaN === NaN` is false, so `findIndex` never matches. `Set`
 uses SameValueZero, so `[NaN].size === 1`.
+
+
+## Server-level validation (second pass)
+
+An earlier draft of this report validated the "DynamoDB would reject this" claims by
+reading the AWS expression grammar. That is second-hand evidence. A second pass
+re-ran every contested request against a **real DynamoDB server implementation**
+(`dynalite`, a pure-JS DynamoDB) and let the server decide.
+
+Scripts: `validate-e2e.js`, `validate-e2e-2.js` (need a server on `:8002`).
+
+| Finding | Request sent | Server verdict |
+|---|---|---|
+| F9 — `in([])` | `FilterExpression: "#a0 IN ()"` | **REJECTED** — `ValidationException: Syntax error; Expected "#", "(", ":", "_", or [a-zA-Z] but ")" found` |
+| F10 — `between(1)` | `"#a0 BETWEEN :v0_1 AND :v0_2"` | **REJECTED** — `An expression attribute value used in expression is not defined; attribute value: :v0_2` |
+| F12a — `in()` on sort key | `"#qha = :qhv AND #qra IN (:qrv_1, :qrv_2)"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: IN` |
+| F12b — `not().eq()` on sort key | `"#qha = :qhv AND #qra <> :qrv"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: <>` |
+| F12c — `not().exists()` on sort key | `"#qha = :qhv AND attribute_not_exists (#qra)"` | **REJECTED** — `Invalid operator used in KeyConditionExpression: attribute_not_exists` |
+| F13 — `>` on the partition key | `"#qha > :qhv"` | **REJECTED** — `Query key condition not supported` |
+| F23 — empty group | `"#a0 = :v0 AND AND #a1 = :v1"` | **REJECTED** — `Syntax error; Expected "(" or "NOT" but "A" found` |
+| F7b — grouped hash key (≥9 extra conditions) | `KeyConditionExpression: "#qha0 = :qhv0"` with `#qha0`/`:qhv0` absent | **REJECTED** — `An expression attribute name used in the document path is not defined; attribute name: #qha0` |
+
+**Controls — every one accepted**, which is what makes the rejections meaningful:
+
+| Control | Verdict |
+|---|---|
+| `eq` on the sort key | accepted |
+| `beginsWith` on the sort key | accepted |
+| `between` on the sort key | accepted |
+| a plain `hash = AND range =` query | accepted |
+| a grouped condition in a **Scan** | accepted |
+
+Two corrections this pass forced:
+
+1. **F23's emitted text varies by path.** Through `Model.scan()` the expression is
+   `"#a0 = :v0 AND AND #a1 = :v1"`; through a bare `Condition.requestObject` it is
+   `"#a0 = :v0 AND () AND #a1 = :v1"`. Both are invalid; the report previously
+   quoted only the second.
+2. **F7 variant A (the client-side crash) is narrower than first stated.** It did
+   *not* reproduce when `.using()` named a real index whose key schema matches the
+   model. The crash needs a specific shape (a grouped key condition plus an index
+   whose key is not resolvable that way). Variant B — the placeholder corruption —
+   reproduces reliably and is server-rejected, so F7 stands on variant B. Variant A
+   should be described as "reproduces under narrower conditions", not "any grouped
+   hash key".
+
+**Caveat:** `dynalite` is a reimplementation, not AWS. A rejection is strong
+evidence of invalidity; an acceptance is weaker evidence of validity. The
+accept/reject split across controls and cases is consistent with the AWS grammar,
+which is the important signal.
 
 ## Refuted during the adversarial review
 
