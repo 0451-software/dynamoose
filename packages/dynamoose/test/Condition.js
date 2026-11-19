@@ -271,3 +271,33 @@ describe("Condition", () => {
 		});
 	});
 });
+
+describe("Condition - in() with an empty array (regression)", () => {
+	// DynamoDB's grammar requires at least one operand:
+	//   {operand} IN ( {operand} (',' {operand} ... ) )
+	// so `IN ()` is not derivable and the server rejects it with a syntax error.
+	// Dynamoose must not emit it.
+	const model = {
+		"getInternalProperties": () => ({
+			"table": () => ({
+				"getInternalProperties": () => ({
+					"instance": Instance.default
+				})
+			}),
+			"schemaForObject": () => new dynamoose.Schema({"id": String, "name": String}),
+			"dynamoPropertyForAttribute": (key) => key
+		})
+	};
+
+	it("Should reject an empty array instead of emitting `IN ()`", async () => {
+		const condition = new dynamoose.Condition().where("name").in([]);
+		await expect(condition.getInternalProperties(internalProperties).requestObject(model, {"conditionString": "ConditionExpression", "conditionStringType": "string"}))
+			.rejects.toThrow(/non-empty array/u);
+	});
+
+	it("Should still accept a non-empty array (control)", async () => {
+		const condition = new dynamoose.Condition().where("name").in(["a"]);
+		const result = await condition.getInternalProperties(internalProperties).requestObject(model, {"conditionString": "ConditionExpression", "conditionStringType": "string"});
+		expect(result.ConditionExpression).toBe("#a0 IN (:v0_1)");
+	});
+});
