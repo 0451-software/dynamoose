@@ -11,14 +11,16 @@ worktree: `utils`, `schema`, `condition` + `itemretriever`, `item` + `model`, an
 `table` + `model` + `serializer`. Every candidate was then put through a sixth
 agent whose only job was to **refute** it.
 
-That last step mattered. Three candidates were refuted and dropped, and the
-severity of five more was corrected downward. The final count is **16 confirmed
-bugs**, not the 23 candidates that were initially reported.
+That last step mattered. Three candidates were refuted and dropped, one was
+reclassified as a documentation inaccuracy, and the severity of five more was
+corrected downward. The final count is **25 confirmed bugs**, not the 41
+candidates that were initially reported.
 
 Every finding below was reproduced by running the code against the real
-`dynamoose` public API, not by reading it. The discovery suite lives in
-`packages/dynamoose/test/pbt/` and is organised so that each confirmed bug has a
-named, self-contained failing test.
+`dynamoose` public API, not by reading it — and each was then re-verified
+independently by a second agent that had no stake in the original claim. The
+discovery suite lives in `packages/dynamoose/test/pbt/` and is organised so that
+each confirmed bug has a named, self-contained failing test.
 
 ## The confirmed bugs
 
@@ -275,6 +277,107 @@ the rename is skipped and the schema-named key is then removed by the
 
 No existing test covers an alias with a falsy value.
 
+### 18. A schema-level `set` modifier makes `dynamoPropertyForAttribute` return the WRONG attribute — **HIGH**
+```js
+const M = dynamoose.model("M", new dynamoose.Schema(
+  {"id": Number, "name": String},
+  {"set": (item) => ({type: "user", ...item})}
+));
+await M.Model.getInternalProperties(ip).dynamoPropertyForAttribute("name");
+// actual: "type"     expected: "name"
+```
+Root cause: `Model/index.ts:278-279` builds a probe object `{[attribute]: true}` and
+returns `Object.keys(obj)[0]` — the **first** key — which a `set` modifier can reorder.
+
+Every `Condition` on such a model silently filters on the **wrong attribute**
+(`ExpressionAttributeNames: {"#a0": "type"}`). Reachable from `Model.scan`,
+`Model.query`, `Model.update`, `Model.delete` with a condition.
+
+### 19. `dynamoPropertyForAttribute` crashes on a type-specific `set` modifier — **HIGH**
+```js
+const M = dynamoose.model("M", {"id": Number, "name": {"type": String, "set": (v) => v.trim()}});
+await M.Model.getInternalProperties(ip).dynamoPropertyForAttribute("name");
+// TypeError: v.trim is not a function
+```
+Root cause: `Model/index.ts:278` passes the literal `true` as the attribute value
+with `modifiers: ["set"]`, so the modifier receives `true` instead of the value.
+`Model.scan(cond)`, `Model.query(cond)`, `Model.delete(key, {condition})` and
+`Model.update(key, obj, {condition})` all throw.
+
+### 20. `Model.update` silently drops an aliased attribute — **HIGH**
+```js
+const M = dynamoose.model("M", {"id": Number, "name": {"type": String, "alias": "userName"}});
+await M.update({"id": 1}, {"userName": "bob"}, {"return": "request"});
+// actual:   {"UpdateExpression": "", "ExpressionAttributeNames": {}}
+// expected: {"UpdateExpression": "SET #a0 = :v0", "ExpressionAttributeNames": {"#a0": "name"}}
+```
+Root cause: `Model/index.ts:757` reads back `[subKey]` (the alias) from a result
+that `objectFromSchema` already renamed to the schema attribute name, so the
+value is `undefined` and the branch at `:760-765` drops the update. A silent
+no-op write. The same call keyed by the schema name works.
+
+### 21. A schema attribute literally named `"0"` crashes every schema-aware path — **MEDIUM**
+```js
+const M = dynamoose.model("M", {"id": Number, "0": String});
+await new M({"id": 1, "0": "x"}).save();
+// TypeError: node.forEach is not a function
+```
+Root cause: `Item.ts:577-586` assumes any node named `"0"` is an array index.
+`"1"`, `"00"`, `"a0"` all work — only the exact `"0"` is broken. The Schema
+constructor accepts the name (only dots are forbidden).
+
+### 22. The key condition can use a non-equality operator on the partition key — **MEDIUM-HIGH**
+```js
+Model.query("age").eq(1).where("id").gt(2).where("id").eq(3).getRequest();
+// KeyConditionExpression: "#qha > :qhv"   (the real `id = 3` is stranded in the filter)
+```
+AWS requires the partition key to be an equality condition. Root cause:
+`ItemRetriever.ts:192` picks the **first** placeholder for the hash attribute.
+
+Related: the comparison chart keeps only the **last** comparison per attribute
+(`Condition.ts:264-269` overwrites `res[key]`), so `query("id").eq(1).where("id").gt(2)`
+throws `Index can't be found for query.` — the hash-key equality is invisible to
+`find_best_index`.
+
+### 23. An empty parenthesised group produces an invalid expression — **MEDIUM**
+```js
+new Condition().where("name").eq(1).parenthesis((c) => c).where("id").eq(2);
+// ConditionExpression: "#a0 = :v0 AND () AND #a1 = :v1"
+```
+Root cause: `utils.object.clearEmpties` deletes the empty nested array from the
+`FilterExpression` array, leaving a hole, while both `AND` connectors survive
+(`Condition.ts:245-255`).
+
+### 24. Type settings leak across entries of a multi-type array — **MEDIUM**
+```js
+new Schema({"id": {"type": [{"value": Date, "settings": {"storage": "iso"}}, Date]}});
+// getAttributeTypeDetails("id").map(d => d.dynamodbType)
+// actual:   ["S", "S"]     expected: ["S", "N"]
+```
+The plain `Date` inherits the previous entry's `storage: "iso"`, so it is stored
+as an ISO **string** instead of a number — the DynamoDB attribute type differs
+from what the schema declares. Root cause: `Schema.ts:1662` declares
+`typeSettings` outside the `.map()` callback and `:1711` reassigns it without
+restoring. The reverse order is correct, which is the decisive evidence.
+
+### 25. `keyBy` drops the entry whose key is `"__proto__"` — **MEDIUM**
+```js
+Object.keys(utils.keyBy([{id: "__proto__"}], "id"));   // => []   expected ["__proto__"]
+```
+Root cause: `keyBy.ts:22-25` compiles to `Object.assign`, which uses `[[Set]]`,
+so assigning `"__proto__"` fires the setter instead of creating an own key.
+`merge_objects.schemaAttributesMerger` keyBy's DynamoDB attribute names, so a
+real attribute definition can be dropped from a create-table request.
+
+### 26. `unique_array_elements` drops a `NaN` element — **LOW-MEDIUM**
+```js
+utils.unique_array_elements([NaN]);      // => []     expected [NaN]
+utils.unique_array_elements([1, NaN, 2]) // => [1, 2]  (the NaN is gone)
+```
+Root cause: `unique_array_elements.ts:3` uses `obj.equals`, whose fast path is
+`a === b` — and `NaN === NaN` is false, so `findIndex` never matches. `Set`
+uses SameValueZero, so `[NaN].size === 1`.
+
 ## Refuted during the adversarial review
 
 These were reported by an agent and then **refuted**. They are recorded here so
@@ -287,6 +390,10 @@ they are not re-investigated.
 | `find_best_index` mutates the caller's index objects | Real, but the objects are freshly built by `Schema.getIndexes()` on every call, never shared between models, never serialized into a `CreateTable`/`UpdateTable` payload, and the only consumer recomputes the hash/range itself. Unobservable. |
 | A null value defeats the documented "default applies to null" | A **documentation** inaccuracy, not a bug. `dynamoose.type.NULL` exists precisely to make an explicit null a first-class value, and `test/Item.js:3263-3267` asserts that a null against a typed attribute throws `TypeMismatch`. The `Schema.ts:438` JSDoc sentence is the loose part. |
 | `type_name` crashes on an own `constructor: null` | The crash is real, but rejecting such documents is correct: Dynamoose's `Object` type requires `val.constructor === undefined \|\| val.constructor === Object` (`Schema.ts:176`), and the AWS SDK's `marshall` independently refuses them. Only the error *message* is wrong. |
+| `merge_objects` mutates its first argument (re-raised by the utils agent) | Re-confirmed as by-design: the first argument *is* the accumulator (`merge_objects.ts:26-27`). No call site depends on non-mutation, and `Condition.ts:178` defensively spreads both operands where it matters. |
+| `deep_copy` does not deep-copy `Map`/`Set` contents (re-raised by the utils agent) | Same verdict as above: real behaviour, but the contract (per the function's own tests) is container-copy, and DynamoDB-backed data cannot contain a `Map` or a `Set` of mutable objects. |
+| A `null` value defeats the documented "default applies to null" | A **documentation** inaccuracy, not a bug. `dynamoose.type.NULL` exists precisely to make an explicit null a first-class value, and `test/Item.js:3263-3267` asserts that a null against a typed attribute throws `TypeMismatch`. The `Schema.ts:438` JSDoc sentence is the loose part. |
+| `find_best_index` mutates the caller's index objects (re-raised) | Real, but the objects are freshly built by `Schema.getIndexes()` on every call, never shared, never serialized into a `CreateTable`/`UpdateTable` payload, and the only consumer recomputes the hash/range itself. Unobservable. |
 
 ## Properties that held
 
@@ -317,15 +424,36 @@ These are as valuable as the bugs — they pin down intended behaviour:
   DynamoDB. The AWS SDK's serialisation of the malformed requests was checked
   directly.
 - `Item.save` / `Model.create` against a live table were not exercised.
-- The `dynamoose-logger` package was not investigated.
+- The `dynamoose-logger` package was not investigated (it shares
+  `wildcard_allowed_check` with the core, so its semantics are inherited).
+- The `Schema` `Combine` type, `Model`-typed attributes and `dynamoose.type.THIS`
+  were not property-tested — they need a live model/table.
+- `Item` `set`/`get` modifiers, custom types and multi-schema models were only
+  probed by hand, not fuzzed exhaustively.
+- Duplicate explicit index names were flagged by one agent but left unresolved:
+  `getIndexes()` and `getCreateTableAttributeParams()` disagree on the count.
+- `conformToSchema` is not idempotent when a `get` modifier is present
+  (`"bob"` → `"bob!"` → `"bob!!"`). No documented contract states idempotence,
+  and no internal path double-applies it, so this is listed but not confirmed.
 - `Schema` custom types (`get`/`set`/`validate` modifiers) were covered only
   shallowly.
 
 ## Suggested order of work
 
-Findings 1–3 are user-visible failures on ordinary, documented API usage. They
-should come first. Findings 4–5 are silent data loss and should come next.
-Findings 7, 10 and 14 are hardening items.
+Findings 1–3, 18–20 and 22 are user-visible failures on ordinary, documented
+API usage — they should come first. Findings 4–5, 17 and 26 are silent data
+loss and should come next. Findings 7, 10 and 14 are hardening items.
+
+Findings 18–20 share a theme worth calling out: **a modifier or alias silently
+changes which attribute is targeted**. In each case the request is still
+well-formed, so nothing errors — it just operates on the wrong data. These are
+the ones most likely to cause real harm in production, because nothing in the
+logs looks wrong.
+
+Findings 1, 2, 9, 10, 15, 21–23 all produce requests that DynamoDB will
+reject. They are loud failures rather than silent ones, which makes them easier
+to triage — but they are still bugs, and 1, 2 and 3 are on the most ordinary
+query patterns there are.
 
 Per `AGENTS.md`, every change must be reviewed and approved by a human before
 being submitted upstream, and any AI involvement must be disclosed in the PR
