@@ -1,7 +1,7 @@
 # Property-based testing investigation — dynamoose
 
 **Target:** `https://github.com/dynamoose/dynamoose` @ `efa6c0f` (v4.2.0)
-**Method:** property-based testing with `fast-check@3.23.2`, plus an adversarial review pass
+**Method:** property-based testing with `fast-check@3.23.2`, an independent adversarial review pass by a second model, and end-to-end validation against a real DynamoDB server (DynamoDB Local)
 **Discovery branch:** `pbt/discovery`
 
 ## How this was done
