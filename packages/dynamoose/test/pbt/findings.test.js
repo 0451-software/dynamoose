@@ -365,10 +365,26 @@ describe("FINDING 14: an array default containing a null element is silently dro
 });
 
 
-describe("FINDING 15: a null value defeats the documented 'default applies to null' behaviour", () => {
-	// Schema.ts:438 — "You can set a default value for an attribute that will be applied upon
-	// save if the given attribute value is `null` or `undefined`."
-	it("a null value throws a TypeMismatch instead of falling back to the default", async () => {
+// NOT A BUG — documentation inaccuracy. Tracked here so the finding is not lost,
+// but it must NOT be reported as a defect without maintainer sign-off.
+//
+// Schema.ts:438 says: "You can set a default value for an attribute that will be applied
+// upon save if the given attribute value is `null` or `undefined`." In practice only
+// `undefined` triggers the default; a `null` throws a TypeMismatch, because
+// `Item.objectFromSchema` runs the type check (Item.ts:664) BEFORE the defaults block
+// (Item.ts:704).
+//
+// The code side is the stronger one:
+//  - `dynamoose.type.NULL` exists precisely to make an explicit null a first-class value,
+//    so a raw `null` on a typed attribute is a type violation by design.
+//  - The existing suite asserts it: test/Item.js:3263-3267 expects
+//    "Expected data to be of type string, instead found type null." for a null value.
+//  - No existing test exercises `default` + `null` together, so the interaction is
+//    genuinely unspecified rather than contradicted.
+//
+// It fails loudly with a correct, attributed error and corrupts nothing.
+describe("NOT A BUG (documentation inaccuracy): the JSDoc says a default applies to null", () => {
+	it("a null value throws a TypeMismatch while an absent value gets the default", async () => {
 		const M = dynamoose.model("NullDefaultCat", {"id": Number, "age": {"type": Number, "default": 5}});
 
 		let error = null;
@@ -377,12 +393,11 @@ describe("FINDING 15: a null value defeats the documented 'default applies to nu
 		} catch (e) {
 			error = e;
 		}
-		expect(error).toBe(null);
-	});
+		expect(error).not.toBe(null);
+		expect(error.message).toContain("instead found type null");
 
-	it("control: an ABSENT value does get the default", async () => {
-		const M = dynamoose.model("NullDefaultCat2", {"id": Number, "age": {"type": Number, "default": 5}});
-		const result = await new M({"id": 1}).toDynamo({"defaults": true});
+		const M2 = dynamoose.model("NullDefaultCat2", {"id": Number, "age": {"type": Number, "default": 5}});
+		const result = await new M2({"id": 1}).toDynamo({"defaults": true});
 		expect(result).toEqual({"id": {"N": "1"}, "age": {"N": "5"}});
 	});
 });
