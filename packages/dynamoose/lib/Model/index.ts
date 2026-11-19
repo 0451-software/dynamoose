@@ -746,6 +746,10 @@ export class Model<T extends ItemCarrier = AnyItem> extends InternalPropertiesCl
 
 					const expressionKey = `#a${index}`;
 					subKey = Array.isArray(value) ? subValue : subKey;
+					// The name written into the expression can differ from `subKey` when the
+					// attribute has an alias: the request must target the DynamoDB attribute
+					// name, not the application-facing alias.
+					let attributeName = subKey;
 
 					let dynamoType;
 					try {
@@ -754,7 +758,16 @@ export class Model<T extends ItemCarrier = AnyItem> extends InternalPropertiesCl
 					const attributeExists = schema.attributes().includes(subKey);
 					const dynamooseUndefined = type.UNDEFINED;
 					if (!updateType.attributeOnly && subValue !== dynamooseUndefined) {
-						subValue = (await this.Item.objectFromSchema({[subKey]: dynamoType === "L" && !Array.isArray(subValue) ? [subValue] : subValue}, this, {"type": "toDynamo", "customTypesDynamo": true, "saveUnknown": true, "mapAttributes": true, ...updateType.objectFromSchemaSettings} as any))[subKey];
+						const mappedUpdateObject = await this.Item.objectFromSchema({[subKey]: dynamoType === "L" && !Array.isArray(subValue) ? [subValue] : subValue}, this, {"type": "toDynamo", "customTypesDynamo": true, "saveUnknown": true, "mapAttributes": true, ...updateType.objectFromSchemaSettings} as any);
+						// objectFromSchema renames an aliased attribute to its DynamoDB name, so
+						// reading it back by `subKey` (which may be the alias the caller used)
+						// returned undefined and dropped the attribute. Fall back to the single
+						// value when the key is not present under its original name.
+						subValue = mappedUpdateObject[subKey] !== undefined ? mappedUpdateObject[subKey] : Object.values(mappedUpdateObject)[0];
+						const mappedKey = Object.keys(mappedUpdateObject)[0];
+						if (mappedKey !== undefined) {
+							attributeName = mappedKey;
+						}
 					}
 
 					if (subValue === dynamooseUndefined || subValue === undefined) {
@@ -777,8 +790,15 @@ export class Model<T extends ItemCarrier = AnyItem> extends InternalPropertiesCl
 						await schema.requiredCheck(subKey, undefined);
 					}
 
+					const keyAttributes = [this.getInternalProperties(internalProperties).getHashKey(), this.getInternalProperties(internalProperties).getRangeKey()].filter((keyName) => keyName);
+					if (keyAttributes.includes(attributeName)) {
+						// Key attributes identify the item. DynamoDB does not allow updating them,
+						// so they must not appear in the update expression.
+						continue;
+					}
+
 					let expressionValue = updateType.attributeOnly ? "" : `:v${index}`;
-					accumulator.ExpressionAttributeNames[expressionKey] = subKey;
+					accumulator.ExpressionAttributeNames[expressionKey] = attributeName;
 					if (!updateType.attributeOnly) {
 						accumulator.ExpressionAttributeValues[expressionValue] = subValue;
 					}
