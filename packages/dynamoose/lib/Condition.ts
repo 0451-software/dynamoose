@@ -220,6 +220,9 @@ export class Condition extends InternalPropertiesClass<ConditionInternalProperti
 								expression = `${keys.name} ${condition.type.startsWith("G") ? ">" : "<"}${condition.type.endsWith("E") ? "=" : ""} ${keys.value}`;
 								break;
 							case "BETWEEN":
+								if (!Array.isArray(value) || value.length !== 2) {
+									throw new CustomError.InvalidParameter("between() requires exactly two values. With fewer or more, the generated expression references a value placeholder that is never defined, and DynamoDB rejects the request.");
+								}
 								expression = `${keys.name} BETWEEN ${keys.value}_1 AND ${keys.value}_2`;
 								object.ExpressionAttributeValues[`${keys.value}_1`] = await toDynamo(key, value[0]);
 								object.ExpressionAttributeValues[`${keys.value}_2`] = await toDynamo(key, value[1]);
